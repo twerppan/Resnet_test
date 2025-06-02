@@ -464,11 +464,12 @@ def create_split_fn(model, start_layer, end_layer, num_splits=4):
 
     return forward_fn
 
+# 根据瓶颈块选择张量切割后计算模型的精度函数
 def evaluate_precision_decay(cases):
     # 配置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 加载预训练的resnet50模型
+    # 加载预训练的AlexNet模型
     model = resnet50(pretrained=True).to(device)
     model.eval()
 
@@ -479,17 +480,16 @@ def evaluate_precision_decay(cases):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-
     for case in cases:
         # 定义保存预测结果的文件路径
-        predict_txt = f"test5k\CutPredict{case['cut_layer']} -- {case['paste_layer']}_5k.txt"
+        predict_txt = f"test\CutPredict{case['cut_layer']} -- {case['paste_layer']}.txt"
 
         # 初始化预测文件
         with open(predict_txt, 'w') as f:
             pass  # 创建文件
 
         # 遍历目录中的所有图片文件
-        images_dir = r"E:\LocalSendDownload\ILSVRC2012_test5k"
+        images_dir = r"D:\BaiduNetdiskDownload\ILSVRC2012_img_val"
         image_files = [f for f in os.listdir(images_dir) if f.endswith(".JPEG")]
         total_images = len(image_files)
         with open(predict_txt, 'a') as f:
@@ -510,13 +510,13 @@ def evaluate_precision_decay(cases):
                 img_name = img_file.split('.')[0]
 
                 f.write(f"{img_name}: {predicted_class}\n")
-        print(f"{case['cut_layer']} -- {case['paste_layer']}的5k图像的预测结果已写入")
+        print("所有图像的预测结果已写入到 cut_predict.txt")
 
         correct = 0
         total = 0
 
         # 读取真实类别和预测类别文件
-        with open(r"ground_truth_label_5k.txt", 'r') as f_label, \
+        with open(r"ground_truth_label.txt", 'r') as f_label, \
                 open(predict_txt, 'r') as f_predict:
             # 逐行读取并比较
             for line_label, line_predict in zip(f_label, f_predict):
@@ -535,7 +535,7 @@ def evaluate_precision_decay(cases):
 
         # 计算准确率
         accuracy = correct / total if total != 0 else 0
-        case['accuracy'] = accuracy
+        case.append(accuracy)
         print(f"模型准确率: {accuracy:.2%} ({correct}/{total})")
     return cases
 
@@ -628,40 +628,35 @@ if __name__ == "__main__":
     # 1.2 滑动窗口合并
     merged,merged_topk,logical_layers = find_bottleneck_segments(df, blocks,window=2,thresh_ratio=1.8)
     print("合并后的瓶颈块merged:", merged)
-    print("数据量降序排序的瓶颈块merged_topk:",merged_topk)
+    print("按数据量降序排序的瓶颈块:",merged_topk)
     print("寻找到逻辑块后的逻辑层logical_layers:", logical_layers)
 
     cases = case_select(df, merged_topk)
-    print(f'验证的瓶颈层案例cases：{cases}')
-    start_time = time.time()
+    print(f'验证的瓶颈层案例：{cases}')
+    # evaluate_precision_decay(cases)
+    accuracy_list = [75.68,74.90,74.91]
+    for i in range(3):
+        cases[i]['accuracy']=accuracy_list[i]
+    max_case = max(cases, key=lambda x: x['accuracy'])
+    print(max_case)
 
-    print(f'预测精度后的cases{evaluate_precision_decay(cases)}')
-    end_time = time.time()
-    print(f'调用精度函数耗时{end_time - start_time}s')
-    #
-    # accuracy_list = [75.68,74.90,74.91]
-    # for i in range(3):
-    #     cases[i]['accuracy']=accuracy_list[i]
-    # max_case = max(cases, key=lambda x: x['accuracy'])
-    # print(max_case)
-    #
-    # bottleneck = (max_case['start_idx'], max_case['end_idx'])
-    # # # 1.4 对剩余逻辑块执行 NSGA-II 搜索帕累托最优切割方案
-    # # bottleneck = merged[0]
-    # # print("瓶颈块:", bottleneck)
-    # index_front = 0
-    #
-    # for i in range(len(logical_layers)):
-    #     if logical_layers[i][0]==max_case['cut_layer']:
-    #         index_front = i
-    # index_back = index_front+1
-    #
-    # print(f'index_front:{index_front}')
-    # front_block = logical_layers[:index_front]
-    # back_block = logical_layers[index_back:]
-    # print(f'front_block:{front_block}')
-    # print(f'back_block:{back_block}')
-    # pareto1 = nsga2_optimize(front_block)
-    # pareto2 = nsga2_optimize(back_block)
-    # print("Pareto1 最优切割方案:", pareto1)
-    # print("Pareto2 最优切割方案:", pareto2)
+    bottleneck = (max_case['start_idx'], max_case['end_idx'])
+    # # 1.4 对剩余逻辑块执行 NSGA-II 搜索帕累托最优切割方案
+    # bottleneck = merged[0]
+    # print("瓶颈块:", bottleneck)
+    index_front = 0
+
+    for i in range(len(logical_layers)):
+        if logical_layers[i][0]==max_case['cut_layer']:
+            index_front = i
+    index_back = index_front+1
+
+    print(f'index_front:{index_front}')
+    front_block = logical_layers[:index_front]
+    back_block = logical_layers[index_back:]
+    print(f'front_block:{front_block}')
+    print(f'back_block:{back_block}')
+    pareto1 = nsga2_optimize(front_block)
+    pareto2 = nsga2_optimize(back_block)
+    print("Pareto1 最优切割方案:", pareto1)
+    print("Pareto2 最优切割方案:", pareto2)
