@@ -409,6 +409,8 @@ def evaluate_individual(cut_points, block_info, device_flops, mem_limit, bandwid
         for i in range(1, len(device_stats)):
             prev_delay = delays[i - 1]
             comm_delay = comm_times[i - 1] if i - 1 < len(comm_times) else 0
+            if device_stats[i]['device'] == device_stats[i - 1]['device']:
+                comm_delay = 0  # 如果在同一个设备上，通信延迟为0
             start_time = max(prev_delay, prev_delay + comm_delay)
             delays.append(start_time + device_stats[i]['compute_time'])
 
@@ -422,11 +424,11 @@ def evaluate_individual(cut_points, block_info, device_flops, mem_limit, bandwid
         for stats in device_stats:
             if stats['memory'] > mem_limit:
                 mem_over += (stats['memory'] - mem_limit)
-
+        # print(f'device_stats:{device_stats}')
         # 目标4: 负载均衡 (计算时间方差)
         compute_times = [stats['compute_time'] for stats in device_stats]
         if len(compute_times) > 1:
-            compute_var = np.var(compute_times)
+            compute_var = np.std(compute_times)
         else:
             compute_var = 0
 
@@ -730,8 +732,8 @@ if __name__ == '__main__':
         'rpi5_3': 320e9,
         'jetson': 472e9
     }
-    mem_limit = 4 * 1024 ** 3  # 4GB
-    bandwidth_bps = 1e6  # 1MB/s
+    mem_limit = 4 * 1024 ** 2  # 4GB
+    bandwidth_bps = 5e7  # 1MB/s
 
     # 5. 运行优化
     pareto_solutions, block_info = nsga2_optimize(

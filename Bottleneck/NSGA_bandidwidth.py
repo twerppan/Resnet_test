@@ -1,4 +1,4 @@
-import time
+import random
 from torchvision.models import resnet50
 import itertools
 import torch
@@ -14,6 +14,7 @@ from PIL import Image
 from torch.fx import symbolic_trace, GraphModule
 import random
 import numpy as np
+from scipy.stats import rankdata
 
 # --- 步骤 1.1：关键路径判断算法识别关键路径。 & 将不可分割节点合并为逻辑块 ---
 def find_critical_edges_dag(edges):
@@ -145,9 +146,6 @@ def profile_and_tabulate(model, input_shape=(1, 3, 224, 224)):
     return df[
         ['idx', 'node', 'shape', 'size', 'weight_memory', 'bias_memory', 'total_memory', 'flops (MFLOPs)', 'is_cut',
          'edge_to_next']]
-
-
-#---构建得到关键边后的逻辑块---
 def build_logic_blocks(fx_net):
     """构建逻辑块：将连通且不可在关键路径处剪切的节点合并为块  返回逻辑块列表，每个块为节点名列表"""
     # 构建 FX 图的 DAG
@@ -176,393 +174,6 @@ def build_logic_blocks(fx_net):
     # --- 步骤 1.2：滑动窗口合并检测瓶颈块 ---
 
 
-def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
-    """
-        merged: 合并后的瓶颈段(节点索引范围)
-        merged_topk: 按总计算量排序的前K个瓶颈段
-        logical_layers: 逻辑层映射表
-    """
-    # 步骤1: 计算每个逻辑块的总计算量和节点索引范围
-    block_flops = []
-    block_indices = []  # 存储每个逻辑块的起始和结束节点索引
-    block_nodes = []  # 存储每个逻辑块的节点名列表
-
-    # 创建节点名到df行的映射
-    node_to_row = {row['node']: row for _, row in df.iterrows()}
-
-    for block in blocks:
-        # 计算逻辑块的总FLOPs
-        total_flops = 0
-        start_idx = float('inf')
-        end_idx = -1
-        node_list = []
-
-        for node_name in block:
-            row = node_to_row.get(node_name)
-            if row is not None:
-                total_flops += row['flops (MFLOPs)']
-                node_list.append(node_name)
-                start_idx = min(start_idx, row['idx'])
-                end_idx = max(end_idx, row['idx'])
-
-        if start_idx <= end_idx:  # 确保有效的索引范围
-            block_flops.append(total_flops)
-            block_indices.append((start_idx, end_idx))
-            block_nodes.append(node_list)
-
-    if not block_flops:
-        return [], [], []
-
-    # 步骤2: 滑动窗口检测瓶颈段
-    avg_flops = sum(block_flops) / len(block_flops)
-    segments = []
-
-    # 在逻辑块序列上滑动窗口
-    for i in range(len(block_flops) - window + 1):
-        window_flops = sum(block_flops[i:i + window])
-
-        # 检查是否超过阈值
-        if window_flops > window * avg_flops * thresh_ratio:
-            start_idx = block_indices[i][0]  # 窗口第一个块的起始节点索引
-            end_idx = block_indices[i + window - 1][1]  # 窗口最后一个块的结束节点索引
-            segments.append((start_idx, end_idx, window_flops))
-
-    # 步骤3: 合并重叠段
-    if not segments:
-        return [], [], []
-
-    # 按起始索引排序
-    segments.sort(key=lambda x: x[0])
-    merged = []
-
-    current_start, current_end, current_flops = segments[0]
-    for seg in segments[1:]:
-        start, end, flops = seg
-        # 检查是否有重叠
-        if start <= current_end:
-            # 扩展当前段
-            current_end = max(current_end, end)
-            current_flops += flops
-        else:
-            # 保存当前段并开始新段
-            merged.append((current_start, current_end))
-            current_start, current_end, current_flops = start, end, flops
-
-    merged.append((current_start, current_end))
-
-    # 步骤4: 按总计算量排序取TopK
-    merged_topk = []
-    for seg in merged:
-        start, end = seg
-        # 计算该段的总FLOPs
-        total_flops = df[(df['idx'] >= start) & (df['idx'] <= end)]['flops (MFLOPs)'].sum()
-        merged_topk.append((start, end, total_flops))
-
-    # 按总计算量降序排序
-    merged_topk.sort(key=lambda x: x[2], reverse=True)
-    # 取前10个瓶颈段
-    merged_topk = merged_topk[:5]
-
-    logical_layers = [block.copy() for block in block_nodes]
-
-    # 标记哪些块需要合并
-    merge_flags = [False] * len(block_nodes)
-
-    # 对于每个瓶颈段，标记需要合并的块
-    for seg_start, seg_end in merged:
-        for i, (block_start, block_end) in enumerate(block_indices):
-            # 检查块是否完全在瓶颈段内
-            if block_start >= seg_start and block_end <= seg_end:
-                merge_flags[i] = True
-
-    # 合并连续的标记块
-    merged_groups = []
-    current_group = []
-
-    for i, flag in enumerate(merge_flags):
-        if flag:
-            current_group.append(i)
-        else:
-            if current_group:
-                merged_groups.append(current_group)
-                current_group = []
-
-    if current_group:
-        merged_groups.append(current_group)
-
-    # 从后向前处理合并组，避免索引变化问题
-    for group in sorted(merged_groups, key=lambda x: x[0], reverse=True):
-        # 创建合并后的节点列表
-        merged_nodes = []
-        for block_idx in group:
-            merged_nodes.extend(logical_layers[block_idx])
-
-        # 替换第一个块为合并后的节点列表
-        logical_layers[group[0]] = merged_nodes
-
-        # 删除其他被合并的块
-        for block_idx in group[1:]:
-            logical_layers[block_idx] = None
-
-    # 过滤掉被删除的块
-    logical_layers = [block for block in logical_layers if block is not None]
-
-    return merged, merged_topk, logical_layers
-
-
-def case_select(df, merged_topk):
-
-    #   根据瓶颈段信息生成切割点配置
-    cases = []
-    # 遍历每个瓶颈段
-    for seg in merged_topk:
-        start_idx, end_idx, total_flops = seg
-
-        # 获取起始节点信息
-        start_row = df[df['idx'] == start_idx]
-        if not start_row.empty:
-            cut_layer = start_row.iloc[0]['node']
-        else:
-            cut_layer = None
-
-        # 获取结束节点信息
-        end_row = df[df['idx'] == end_idx]
-        if not end_row.empty:
-            paste_layer = end_row.iloc[0]['node']
-        else:
-            paste_layer = None
-
-        # 如果找到了有效的切割点，添加到配置列表
-        if cut_layer and paste_layer:
-            cases.append({
-                'cut_layer': cut_layer,
-                'paste_layer': paste_layer,
-                'start_idx': start_idx,
-                'end_idx': end_idx,
-                'total_flops': total_flops
-            })
-
-    return cases
-
-def split_model(model, start_cut, end_cut):
-    traced = symbolic_trace(model)
-
-    # 查找起始和结束节点（增加容错处理）
-    nodes = list(traced.graph.nodes)
-    # for i in nodes:
-    #     print(i.target)
-    #     print(i.name)
-    start_node = next(n for n in nodes if n.name == start_cut)
-    end_node = next(n for n in nodes if n.name == end_cut)
-
-    # 构建前向部分
-    front_graph = torch.fx.Graph()
-    front_remap = {}
-    front_input = None
-
-    # 复制输入节点和前置节点
-    for node in nodes:
-        if node.op == 'placeholder':
-            front_input = front_graph.placeholder(node.name)
-            front_remap[node] = front_input
-        if node == start_node:
-            break
-        if node.op != 'placeholder':
-            new_node = front_graph.node_copy(node, lambda n: front_remap[n])
-            front_remap[node] = new_node
-
-    # 前向部分输出为start_node的输入
-    front_graph.output(front_remap[start_node.args[0]])
-    front_module = GraphModule(traced, front_graph)
-
-    # 构建中间部分
-    mid_graph = torch.fx.Graph()
-    mid_input = mid_graph.placeholder('mid_input')
-    mid_remap = {start_node.args[0]: mid_input}
-
-    current_node = start_node
-    while current_node != end_node.next:
-        new_node = mid_graph.node_copy(current_node, lambda n: mid_remap.get(n, mid_input))
-        mid_remap[current_node] = new_node
-        current_node = current_node.next
-
-    mid_graph.output(mid_remap[end_node])
-    mid_module = GraphModule(traced, mid_graph)
-
-    # 构建后向部分（关键修正部分）
-    tail_graph = torch.fx.Graph()
-    tail_input = tail_graph.placeholder('tail_input')
-    tail_remap = {end_node: tail_input}
-
-    current_node = end_node.next
-    output_val = None
-
-    # 只复制有效节点，跳过output节点
-    while current_node is not None:
-        if current_node.op == 'output':
-            # 捕获原始输出值
-            output_val = current_node.args[0]
-            break
-        new_node = tail_graph.node_copy(
-            current_node,
-            lambda n: tail_remap.get(n, tail_input)
-        )
-        tail_remap[current_node] = new_node
-        current_node = current_node.next
-
-    # 添加新的输出节点
-    if output_val is not None:
-        tail_graph.output(tail_remap[output_val])
-    else:
-        # 处理没有后续层的情况
-        tail_graph.output(tail_input)
-
-    tail_module = GraphModule(traced, tail_graph)
-
-    return front_module, mid_module, tail_module
-
-
-def create_split_fn(model, start_layer, end_layer, num_splits=4):
-    front, mid, tail = split_model(model, start_layer, end_layer)
-
-    def forward_fn(x):
-        # 前向传播
-        front_out = front(x)
-
-        # print(f'前向传播后shape：{front_out.shape}')
-
-        # 空间维度分割为4份
-        _, _, h, w = front_out.shape
-        h_chunk = h // 2
-        w_chunk = w // 2
-
-        chunks = [
-            front_out[:, :, :h_chunk, :w_chunk],
-            front_out[:, :, :h_chunk, w_chunk:],
-            front_out[:, :, h_chunk:, :w_chunk],
-            front_out[:, :, h_chunk:, w_chunk:],
-        ]
-
-        # for chunk in chunks:
-        #     print(f'mid前每个子张量shape：{chunk.shape}')
-
-        # 并行处理中间部分
-        mid_outs = [mid(chunk) for chunk in chunks]
-
-        # for mid_out in mid_outs:
-        #     print(f'mid后每个字张量shape{mid_out.shape}')
-
-        # 重新拼接张量
-        top = torch.cat([mid_outs[0], mid_outs[1]], dim=3)
-        bottom = torch.cat([mid_outs[2], mid_outs[3]], dim=3)
-        concat_out = torch.cat([top, bottom], dim=2)
-
-        # print(f'拼接后的shape：{concat_out.shape}')
-        # # 后向传播
-        # print(f'最后shape：{tail(concat_out).shape}')
-
-        return tail(concat_out)
-
-    return forward_fn
-# 定义 ImageDataset 类
-class ImageDataset(torch.utils.data.Dataset):
-    def __init__(self, image_files, images_dir, preprocess):
-        self.image_files = image_files
-        self.images_dir = images_dir
-        self.preprocess = preprocess
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, idx):
-        img_path = os.path.join(self.images_dir, self.image_files[idx])
-        img = Image.open(img_path).convert('RGB')
-        input_tensor = self.preprocess(img)
-        return input_tensor, self.image_files[idx]
-
-def evaluate_precision_decay(cases):
-    # 配置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # 加载预训练的resnet50模型并移动到GPU
-    model = resnet50(pretrained=True).to(device)
-    model.eval()
-
-    # 图像预处理Transform
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    # 预先创建所有需要的预测文件
-    predict_files = {}
-    for case in cases:
-        predict_txt = f"test5h/CutPredict{case['cut_layer']} -- {case['paste_layer']}_5h.txt"
-        with open(predict_txt, 'w') as f:
-            pass  # 创建文件
-        predict_files[case['cut_layer'], case['paste_layer']] = predict_txt
-
-    # 遍历目录中的所有图片文件
-    images_dir = r"E:\LocalSendDownload\ILSVRC2012_test5h"
-    image_files = [f for f in os.listdir(images_dir) if f.endswith(".JPEG")]
-    total_images = len(image_files)
-
-    # 创建一个图像数据集并使用 DataLoader 加载
-    dataset = ImageDataset(image_files, images_dir, preprocess)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
-
-    # 初始化预测结果字典
-    predictions = {case['cut_layer'] + ' -- ' + case['paste_layer']: [] for case in cases}
-
-    # 遍历所有图像并进行预测
-    with torch.no_grad():
-        for inputs, img_names in dataloader:
-            inputs = inputs.to(device)
-            for case in cases:
-                split_fn = create_split_fn(model, case['cut_layer'], case['paste_layer'])
-                outputs = split_fn(inputs)
-                probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
-                for img_name, predicted_class in zip(img_names, predicted_classes):
-                    predictions[case['cut_layer'] + ' -- ' + case['paste_layer']].append((img_name.split('.')[0], predicted_class))
-
-    # 写入预测结果到文件
-    for case in cases:
-        predict_txt = predict_files.get((case['cut_layer'], case['paste_layer']))
-        if predict_txt is not None:
-            with open(predict_txt, 'a') as f:
-                for img_name, predicted_class in predictions[case['cut_layer'] + ' -- ' + case['paste_layer']]:
-                    f.write(f"{img_name}: {predicted_class}\n")
-            print(f"{case['cut_layer']} -- {case['paste_layer']}5h图像的预测结果已写入")
-
-            correct = 0
-            total = 0
-
-            # 读取真实类别和预测类别文件进行比较
-            with open(r"ground_truth_label_5h.txt", 'r') as f_label, open(predict_txt, 'r') as f_predict:
-                # 逐行读取并比较
-                for line_label, line_predict in zip(f_label, f_predict):
-                    # 解析真实类别
-                    img_name_label, true_class = line_label.strip().split(': ')
-                    # 解析预测类别
-                    img_name_predict, predicted_class = line_predict.strip().split(': ')
-                    # 确保比较的是同一张图片
-                    if img_name_label != img_name_predict:
-                        print(f"图片名称不匹配：{img_name_label} vs {img_name_predict}")
-                        continue
-                    # 判断预测是否正确
-                    if true_class == predicted_class:
-                        correct += 1
-                    total += 1
-
-            # 计算准确率
-            accuracy = correct / total if total != 0 else 0
-            case['accuracy'] = accuracy
-            print(f"模型准确率: {accuracy:.2%} ({correct}/{total})")
-
-    return cases
 
 def preprocess_blocks(logic_blocks, df):
     """预处理逻辑块信息"""
@@ -594,7 +205,10 @@ def preprocess_blocks(logic_blocks, df):
         })
     return block_info
 
-# --- 步骤 1.4：NSGA-II 多目标优化寻找切割方案的帕累托前沿 ---
+
+
+
+
 
 def nsga2_optimize(logic_blocks, df, device_flops, mem_limit, bandwidth_bps,
                    pop_size=50, ngen=100, threshold=0.01, crossover_rate=0.8, mutation_rate=0.1):
@@ -808,11 +422,11 @@ def evaluate_individual(cut_points, block_info, device_flops, mem_limit, bandwid
         for stats in device_stats:
             if stats['memory'] > mem_limit:
                 mem_over += (stats['memory'] - mem_limit)
-        # print(f'device_stats:{device_stats}')
+
         # 目标4: 负载均衡 (计算时间方差)
         compute_times = [stats['compute_time'] for stats in device_stats]
         if len(compute_times) > 1:
-            compute_var = np.std(compute_times)
+            compute_var = np.var(compute_times)
         else:
             compute_var = 0
 
@@ -1064,49 +678,79 @@ def check_convergence(current_front, prev_front, threshold):
 
     avg_change = sum(min_distances) / len(min_distances)
     return avg_change < threshold
+def calculate_average_bandwidth(file_path):
+    # 初始化一个长度为50的数组来存储每秒的平均带宽
+    time = [[] for _ in range(100)]
+    average_bandwidth = [0 for _ in range(100)]
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+        for i in range(len(lines)):
+            timestamp, bandwidth = lines[i].strip().split()
+            timestamp = float(timestamp)
+            bandwidth = float(bandwidth)
+            if int(timestamp) < 100:
+                time[int(timestamp)].append([timestamp,bandwidth])
+    pre_bandwidth = 0
+    for i in range(100):
+        tmp_time = i
+        tmp_bandwidth = pre_bandwidth
+        ave_ban = 0
+        if len(time[i]) == 0:
+            average_bandwidth[i] = pre_bandwidth
+        else:
+            for j in range(len(time[i])):
+                ave_ban += (time[i][j][0]-tmp_time)*tmp_bandwidth
+                tmp_bandwidth = time[i][j][1]
+                tmp_time = time[i][j][0]
+            ave_ban += (i+1 - tmp_time) * tmp_bandwidth
+            pre_bandwidth = tmp_bandwidth
+            average_bandwidth[i] = ave_ban
 
-
+    return average_bandwidth
 # 主流程示例
-if __name__ == "__main__":
-    # 初始化模型并进行 shape propagation
+if __name__ == '__main__':
+    # 1. 创建ResNet50模型
     model = resnet50()
-    fx = symbolic_trace(model)
-    ShapeProp(fx).propagate(torch.randn(1, 3, 224, 224))
 
-    # 1.1 构建逻辑块
-    blocks = build_logic_blocks(fx)
-    print("关键边后的逻辑块blocks:", blocks)
+    # 2. 分析模型并获取数据表
     df = profile_and_tabulate(model)
-    # 1.2 滑动窗口合并
-    merged,merged_topk,logical_layers = find_bottleneck_segments(df, blocks,window=2,thresh_ratio=1.8)
-    print("合并后的瓶颈块merged:", merged)
-    print("数据量降序排序的瓶颈块merged_topk:",merged_topk)
-    print("寻找到逻辑块后的逻辑层logical_layers:", logical_layers)
 
-    cases = case_select(df, merged_topk)
-    print(f'验证的瓶颈层案例cases：{cases}')
-    # start_time = time.time()
-
-    print(f'预测精度后的cases{evaluate_precision_decay(cases)}')
-    # end_time = time.time()
-    # print(f'调用精度函数耗时{end_time - start_time}s')
-    #
-    # accuracy_list = [75.68,74.90,74.91]
-    # for i in range(3):
-    #     cases[i]['accuracy']=accuracy_list[i]
-    max_case = max(cases, key=lambda x: x['accuracy'])
-    print(max_case)
-
-    #帕累托边界
-    index_front = 0
-
-    for i in range(len(logical_layers)):
-        if logical_layers[i][0]==max_case['cut_layer']:
-            index_front = i
-    index_back = index_front+1
-
-    front_block = logical_layers[:index_front]
-    back_block = logical_layers[index_back:]
+    # 3. 构建逻辑块
+    logic_blocks = build_logic_blocks(symbolic_trace(model))
+    # print(len(logic_blocks))
+    front_block = [['x'], ['conv1'], ['bn1'], ['relu'],
+                  ['maxpool', 'layer1_0_conv1', 'layer1_0_bn1', 'layer1_0_relu', 'layer1_0_conv2', 'layer1_0_bn2',
+                   'layer1_0_relu_1', 'layer1_0_conv3', 'layer1_0_bn3', 'layer1_0_downsample_0',
+                   'layer1_0_downsample_1', 'add'],
+                  ['layer1_0_relu_2', 'layer1_1_conv1', 'layer1_1_bn1', 'layer1_1_relu', 'layer1_1_conv2',
+                   'layer1_1_bn2', 'layer1_1_relu_1', 'layer1_1_conv3', 'layer1_1_bn3', 'add_1']]
+    back_block = [
+        ['layer2_1_relu_2', 'layer2_2_conv1', 'layer2_2_bn1', 'layer2_2_relu', 'layer2_2_conv2', 'layer2_2_bn2',
+         'layer2_2_relu_1', 'layer2_2_conv3', 'layer2_2_bn3', 'add_5'],
+        ['layer2_2_relu_2', 'layer2_3_conv1', 'layer2_3_bn1', 'layer2_3_relu', 'layer2_3_conv2', 'layer2_3_bn2',
+         'layer2_3_relu_1', 'layer2_3_conv3', 'layer2_3_bn3', 'add_6', 'layer2_3_relu_2', 'layer3_0_conv1',
+         'layer3_0_bn1', 'layer3_0_relu', 'layer3_0_conv2', 'layer3_0_bn2', 'layer3_0_relu_1', 'layer3_0_conv3',
+         'layer3_0_bn3', 'layer3_0_downsample_0', 'layer3_0_downsample_1', 'add_7', 'layer3_0_relu_2', 'layer3_1_conv1',
+         'layer3_1_bn1', 'layer3_1_relu', 'layer3_1_conv2', 'layer3_1_bn2', 'layer3_1_relu_1', 'layer3_1_conv3',
+         'layer3_1_bn3', 'add_8'],
+        ['layer3_1_relu_2', 'layer3_2_conv1', 'layer3_2_bn1', 'layer3_2_relu', 'layer3_2_conv2', 'layer3_2_bn2',
+         'layer3_2_relu_1', 'layer3_2_conv3', 'layer3_2_bn3', 'add_9'],
+        ['layer3_2_relu_2', 'layer3_3_conv1', 'layer3_3_bn1', 'layer3_3_relu', 'layer3_3_conv2', 'layer3_3_bn2',
+         'layer3_3_relu_1', 'layer3_3_conv3', 'layer3_3_bn3', 'add_10'],
+        ['layer3_3_relu_2', 'layer3_4_conv1', 'layer3_4_bn1', 'layer3_4_relu', 'layer3_4_conv2', 'layer3_4_bn2',
+         'layer3_4_relu_1', 'layer3_4_conv3', 'layer3_4_bn3', 'add_11'],
+        ['layer3_4_relu_2', 'layer3_5_conv1', 'layer3_5_bn1', 'layer3_5_relu', 'layer3_5_conv2', 'layer3_5_bn2',
+         'layer3_5_relu_1', 'layer3_5_conv3', 'layer3_5_bn3', 'add_12', 'layer3_5_relu_2', 'layer4_0_conv1',
+         'layer4_0_bn1', 'layer4_0_relu', 'layer4_0_conv2', 'layer4_0_bn2', 'layer4_0_relu_1', 'layer4_0_conv3',
+         'layer4_0_bn3', 'layer4_0_downsample_0', 'layer4_0_downsample_1', 'add_13', 'layer4_0_relu_2',
+         'layer4_1_conv1', 'layer4_1_bn1', 'layer4_1_relu', 'layer4_1_conv2', 'layer4_1_bn2', 'layer4_1_relu_1',
+         'layer4_1_conv3', 'layer4_1_bn3', 'add_14'],
+        ['layer4_1_relu_2', 'layer4_2_conv1', 'layer4_2_bn1', 'layer4_2_relu', 'layer4_2_conv2', 'layer4_2_bn2',
+         'layer4_2_relu_1', 'layer4_2_conv3', 'layer4_2_bn3', 'add_15'], ['layer4_2_relu_2'], ['avgpool'], ['flatten'],
+        ['fc'], ['output']]
+    # print(len(front_block))
+    # print(len(back_block))
+    # 4. 设备配置
     device_flops = {
         'pc_cpu': 500e9,
         'rpi5_1': 320e9,
@@ -1114,8 +758,9 @@ if __name__ == "__main__":
         'rpi5_3': 320e9,
         'jetson': 472e9
     }
-    mem_limit = 4 * 1024 ** 2  # 4GB
-    bandwidth_bps = 5e7  # 1MB/s
+    mem_limit = 4 * 1024 ** 3  # 4GB
+    bandwidth_list = calculate_average_bandwidth('../Bandwidth/real_bandwidth2.txt')
+    bandwidth_bps = bandwidth_list[0] * 5e6
 
     # 5. 运行优化
     pareto_solutions, block_info = nsga2_optimize(
