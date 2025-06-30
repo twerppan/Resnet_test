@@ -1,5 +1,5 @@
 import time
-from torchvision.models import resnet50
+from torchvision.models import resnet50,ResNet50_Weights
 import itertools
 import torch
 import torch.nn as nn
@@ -14,7 +14,11 @@ from PIL import Image
 from torch.fx import symbolic_trace, GraphModule
 import random
 import numpy as np
-
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import concurrent.futures
+import multiprocessing
+from functools import partial
 # --- 步骤 1.1：关键路径判断算法识别关键路径。 & 将不可分割节点合并为逻辑块 ---
 def find_critical_edges_dag(edges):
     in_degree = defaultdict(int)
@@ -176,7 +180,7 @@ def build_logic_blocks(fx_net):
     # --- 步骤 1.2：滑动窗口合并检测瓶颈块 ---
 
 
-def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
+def find_bottleneck_segments(df, blocks, thresh_ratio=1.8):
     """
         merged: 合并后的瓶颈段(节点索引范围)
         merged_topk: 按总计算量排序的前K个瓶颈段
@@ -191,7 +195,6 @@ def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
     node_to_row = {row['node']: row for _, row in df.iterrows()}
 
     for block in blocks:
-        # 计算逻辑块的总FLOPs
         total_flops = 0
         start_idx = float('inf')
         end_idx = -1
@@ -213,46 +216,44 @@ def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
     if not block_flops:
         return [], [], []
 
-    # 步骤2: 滑动窗口检测瓶颈段
-    avg_flops = sum(block_flops) / len(block_flops)
-    segments = []
+    # 步骤2: 使用滑动窗口检测瓶颈块
+    n_blocks = len(block_flops)
+    avg_flops = sum(block_flops) / n_blocks
+    segments = []  # 存储检测到的瓶颈段
+    left = 0  # 窗口左指针
+    current_sum = 0  # 当前窗口内FLOPs总和
 
-    # 在逻辑块序列上滑动窗口
-    for i in range(len(block_flops) - window + 1):
-        window_flops = sum(block_flops[i:i + window])
+    # 使用右指针遍历所有逻辑块
+    for right in range(n_blocks):
+        current_sum += block_flops[right]
+        window_size = right - left + 1
+        current_avg = current_sum / window_size
 
-        # 检查是否超过阈值
-        if window_flops > window * avg_flops * thresh_ratio:
-            start_idx = block_indices[i][0]  # 窗口第一个块的起始节点索引
-            end_idx = block_indices[i + window - 1][1]  # 窗口最后一个块的结束节点索引
-            segments.append((start_idx, end_idx, window_flops))
+        # 当窗口平均值小于等于阈值时，记录为瓶颈段
+        if current_avg <= thresh_ratio * avg_flops:
+            # 记录当前窗口（排除新加入的右边界元素）
+            if window_size > 1:  # 至少2个块才能形成有效段
+                start_idx = block_indices[left][0]
+                end_idx = block_indices[right - 1][1]
+                segments.append((start_idx, end_idx))
 
-    # 步骤3: 合并重叠段
-    if not segments:
-        return [], [], []
+            # 重置窗口到下一个位置
+            left = right + 1
+            current_sum = 0
+        # 否则继续扩展窗口（自动发生在循环中）
 
-    # 按起始索引排序
-    segments.sort(key=lambda x: x[0])
-    merged = []
-
-    current_start, current_end, current_flops = segments[0]
-    for seg in segments[1:]:
-        start, end, flops = seg
-        # 检查是否有重叠
-        if start <= current_end:
-            # 扩展当前段
-            current_end = max(current_end, end)
-            current_flops += flops
-        else:
-            # 保存当前段并开始新段
-            merged.append((current_start, current_end))
-            current_start, current_end, current_flops = start, end, flops
-
-    merged.append((current_start, current_end))
-
+    # 检查剩余未处理块
+    if left < n_blocks:
+        # 剩余块作为一个整体检查
+        window_size = n_blocks - left
+        current_avg = sum(block_flops[left:]) / window_size
+        if current_avg <= thresh_ratio * avg_flops:
+            start_idx = block_indices[left][0]
+            end_idx = block_indices[-1][1]
+            segments.append((start_idx, end_idx))
     # 步骤4: 按总计算量排序取TopK
     merged_topk = []
-    for seg in merged:
+    for seg in segments:
         start, end = seg
         # 计算该段的总FLOPs
         total_flops = df[(df['idx'] >= start) & (df['idx'] <= end)]['flops (MFLOPs)'].sum()
@@ -269,7 +270,7 @@ def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
     merge_flags = [False] * len(block_nodes)
 
     # 对于每个瓶颈段，标记需要合并的块
-    for seg_start, seg_end in merged:
+    for seg_start, seg_end in segments:
         for i, (block_start, block_end) in enumerate(block_indices):
             # 检查块是否完全在瓶颈段内
             if block_start >= seg_start and block_end <= seg_end:
@@ -307,7 +308,7 @@ def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
     # 过滤掉被删除的块
     logical_layers = [block for block in logical_layers if block is not None]
 
-    return merged, merged_topk, logical_layers
+    return segments, merged_topk, logical_layers
 
 
 def case_select(df, merged_topk):
@@ -480,89 +481,124 @@ class ImageDataset(torch.utils.data.Dataset):
         input_tensor = self.preprocess(img)
         return input_tensor, self.image_files[idx]
 
-def evaluate_precision_decay(cases):
-    # 配置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 加载预训练的resnet50模型并移动到GPU
-    model = resnet50(pretrained=True).to(device)
-    model.eval()
+class MultiModelEvaluator:
+    def __init__(self, cases, images_dir, ground_truth_path, batch_size=64):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.cases = cases
+        self.images_dir = images_dir
+        self.ground_truth_path = ground_truth_path
+        self.batch_size = batch_size
 
-    # 图像预处理Transform
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+        # 加载原始模型
+        self.base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).to(self.device)
+        self.base_model.eval()
 
-    # 预先创建所有需要的预测文件
-    predict_files = {}
-    for case in cases:
-        predict_txt = f"test5h/CutPredict{case['cut_layer']} -- {case['paste_layer']}_5h.txt"
-        with open(predict_txt, 'w') as f:
-            pass  # 创建文件
-        predict_files[case['cut_layer'], case['paste_layer']] = predict_txt
+        # 创建所有切割模型
+        self.models = {}
+        for case in cases:
+            key = f"{case['cut_layer']}--{case['paste_layer']}"
+            model = self.create_cut_model(case)
+            self.models[key] = {
+                'model': model,
+                'case': case,
+                'predictions': []
+            }
 
-    # 遍历目录中的所有图片文件
-    images_dir = r"E:\11"
-    image_files = [f for f in os.listdir(images_dir) if f.endswith(".JPEG")]
-    total_images = len(image_files)
+        # 图像预处理
+        self.preprocess = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
-    # 创建一个图像数据集并使用 DataLoader 加载
-    dataset = ImageDataset(image_files, images_dir, preprocess)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+        # 加载图像文件列表
+        self.image_files = [f for f in os.listdir(images_dir) if f.endswith(".JPEG")]
+        self.dataset = ImageDataset(self.image_files, images_dir, self.preprocess)
+        self.dataloader = DataLoader(
+            self.dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
 
-    # 初始化预测结果字典
-    predictions = {case['cut_layer'] + ' -- ' + case['paste_layer']: [] for case in cases}
+        # 加载真实标签
+        self.ground_truth = self.load_ground_truth()
 
-    # 遍历所有图像并进行预测
-    with torch.no_grad():
-        for inputs, img_names in dataloader:
-            inputs = inputs.to(device)
-            for case in cases:
-                split_fn = create_split_fn(model, case['cut_layer'], case['paste_layer'])
-                outputs = split_fn(inputs)
-                probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
-                for img_name, predicted_class in zip(img_names, predicted_classes):
-                    predictions[case['cut_layer'] + ' -- ' + case['paste_layer']].append((img_name.split('.')[0], predicted_class))
+    def create_cut_model(self, case):
+        """创建切割模型（不复制基础权重）"""
+        # 使用基础模型的权重引用，避免复制
+        model = resnet50(weights=None).to(self.device)
 
-    # 写入预测结果到文件
-    for case in cases:
-        predict_txt = predict_files.get((case['cut_layer'], case['paste_layer']))
-        if predict_txt is not None:
-            with open(predict_txt, 'a') as f:
-                for img_name, predicted_class in predictions[case['cut_layer'] + ' -- ' + case['paste_layer']]:
-                    f.write(f"{img_name}: {predicted_class}\n")
-            print(f"{case['cut_layer']} -- {case['paste_layer']}5h图像的预测结果已写入")
+        # 共享基础权重
+        for param_src, param_dest in zip(self.base_model.parameters(), model.parameters()):
+            param_dest.data = param_src.data
+            param_dest.requires_grad = False
 
-            correct = 0
-            total = 0
+        # 应用切割
+        split_fn = create_split_fn(model, case['cut_layer'], case['paste_layer'])
+        return split_fn
 
-            # 读取真实类别和预测类别文件进行比较
-            with open(r"ground_truth_label_5h.txt", 'r') as f_label, open(predict_txt, 'r') as f_predict:
-                # 逐行读取并比较
-                for line_label, line_predict in zip(f_label, f_predict):
-                    # 解析真实类别
-                    img_name_label, true_class = line_label.strip().split(': ')
-                    # 解析预测类别
-                    img_name_predict, predicted_class = line_predict.strip().split(': ')
-                    # 确保比较的是同一张图片
-                    if img_name_label != img_name_predict:
-                        print(f"图片名称不匹配：{img_name_label} vs {img_name_predict}")
-                        continue
-                    # 判断预测是否正确
-                    if true_class == predicted_class:
-                        correct += 1
-                    total += 1
+    def load_ground_truth(self):
+        """加载真实标签"""
+        ground_truth = {}
+        with open(self.ground_truth_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(': ')
+                if len(parts) >= 2:
+                    img_name = parts[0]
+                    true_class = parts[1]
+                    ground_truth[img_name] = true_class
+        return ground_truth
+
+    def evaluate(self):
+        """执行评估"""
+        start_time = time.time()
+
+        # 使用大batch一次处理所有模型
+        with torch.no_grad():
+            for inputs, img_names in tqdm(self.dataloader, desc="处理批次"):
+                inputs = inputs.to(self.device, non_blocking=True)
+
+                # 对每个模型执行推理
+                for key, model_info in self.models.items():
+                    outputs = model_info['model'](inputs)
+                    probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                    predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
+
+                    # 存储预测结果
+                    for img_name, pred_class in zip(img_names, predicted_classes):
+                        img_base = os.path.splitext(img_name)[0]
+                        model_info['predictions'].append((img_base, str(pred_class)))
+
+        # 计算准确率并保存结果
+        for key, model_info in self.models.items():
+            case = model_info['case']
+            predict_txt = f"test5h/CutPredict{case['cut_layer']} -- {case['paste_layer']}_5h.txt"
+
+            # 写入预测文件
+            with open(predict_txt, 'w') as f:
+                for img_base, pred_class in model_info['predictions']:
+                    f.write(f"{img_base}: {pred_class}\n")
 
             # 计算准确率
-            accuracy = correct / total if total != 0 else 0
-            case['accuracy'] = accuracy
-            print(f"模型准确率: {accuracy:.2%} ({correct}/{total})")
+            correct = 0
+            total = 0
+            for img_base, pred_class in model_info['predictions']:
+                true_class = self.ground_truth.get(img_base)
+                if true_class and true_class == pred_class:
+                    correct += 1
+                total += 1
 
-    return cases
+            accuracy = correct / total if total > 0 else 0
+            case['accuracy'] = accuracy
+            print(f"切割方案 {key} 准确率: {accuracy:.4f} ({correct}/{total})")
+
+        elapsed = time.time() - start_time
+        print(f"评估完成! 总耗时: {elapsed:.2f}秒")
+        return self.cases
 
 def preprocess_blocks(logic_blocks, df):
     """预处理逻辑块信息"""
@@ -579,7 +615,7 @@ def preprocess_blocks(logic_blocks, df):
         bias_mem = block_df['bias_memory'].sum()
 
         # 计算块的峰值激活内存 (字节)
-        # peak_activation = block_df['size'].max()
+        peak_activation = block_df['size'].max()
 
         # 块的输出大小 (最后一个节点的输出)
         output_size = block_df.iloc[-1]['size']
@@ -588,46 +624,77 @@ def preprocess_blocks(logic_blocks, df):
             'flops': total_flops,
             'weight_mem': weight_mem,
             'bias_mem': bias_mem,
-            # 'peak_activation': peak_activation,
+            'peak_activation': peak_activation,
             'output_size': output_size,
-            'total_memory': weight_mem + bias_mem
+            'total_memory': weight_mem + bias_mem + peak_activation
         })
     return block_info
 
 # --- 步骤 1.4：NSGA-II 多目标优化寻找切割方案的帕累托前沿 ---
 
 
-def nsga2_optimize(logic_blocks1, logic_blocks2, df, device_flops, mem_limit, bandwidth_bps,
+def nsga2_optimize(logic_blocks, big_block_index, df, device_flops, mem_limit, bandwidth_bps,
                    pop_size=50, ngen=100, threshold=0.01, crossover_rate=0.8, mutation_rate=0.1):
     """
     使用 NSGA-II 算法优化模型划分方案
     切割点数量固定为设备数量减一
     """
-    logic_blocks = logic_blocks1 + logic_blocks2
-    fixed_cut = len(logic_blocks1)  # 固定切割点位置
+    # big_block = logic_blocks[big_block_index]
+
+    # 设置2个固定切割点：
+    # 1. 在超大块前（原index_front位置）
+    fixed_cut1 = big_block_index
+    # 2. 在超大块内部（分割两部分）
+    fixed_cut2 = big_block_index + 1
+    # 3. 在超大块后（原index_front+1位置）
+
+    fixed_cuts = [fixed_cut1, fixed_cut2]
+
     # 1. 预处理逻辑块信息
     block_info = preprocess_blocks(logic_blocks, df)
+
+    split_ratio = 0.5  # 等分
+    big_block_part1 = {
+        'name': "bottleneck_part1",
+        'flops': block_info[big_block_index]['flops'] * split_ratio,
+        'total_memory': block_info[big_block_index]['total_memory'] * split_ratio,
+        'output_size': block_info[big_block_index]['output_size'] * split_ratio
+    }
+    big_block_part2 = {
+        'name': "bottleneck_part1",
+        'flops': block_info[big_block_index]['flops'] * (1 - split_ratio),
+        'total_memory': block_info[big_block_index]['total_memory'] * (1 - split_ratio),
+        'output_size': block_info[big_block_index]['output_size'] * (1 - split_ratio)
+    }
+
+    # # 创建新的逻辑块列表（包含拆分后的超大块）
+    new_logic_blocks = (
+            logic_blocks[:big_block_index] +
+            [big_block_part1, big_block_part2] +
+            logic_blocks[big_block_index + 1:]
+    )
     num_blocks = len(block_info)
     num_devices = len(device_flops)
 
     # 计算切割点数量（设备数量减一）
-    num_cuts = num_devices - 2
+    num_cuts = num_devices - 4
 
     # 2. 初始化种群
-    population = initialize_population(num_blocks, num_cuts, pop_size,fixed_cut)
-
+    population = initialize_population(num_blocks, num_cuts, pop_size,fixed_cuts)
     # 3. NSGA-II 主循环
     prev_front = None
     for gen in range(ngen):
+        # print(f'population:{population}')
+
         # 评估种群
         fitness = []
         for ind in population:
-            try:
-                fit = evaluate_individual(ind, fixed_cut,block_info, device_flops, mem_limit, bandwidth_bps)
-                fitness.append(fit)
-            except Exception as e:
-                print(f"评估个体时出错: {e}")
-                fitness.append((float('inf'), float('inf'), float('inf'), float('inf')))
+            # try:
+            fit = evaluate_individual(ind, big_block_index,block_info, device_flops, mem_limit, bandwidth_bps)
+            fitness.append(fit)
+            # except Exception as e:
+            #     print(f"评估个体时出错11: {e}")
+            #     fitness.append((float('inf'), float('inf'), float('inf'), float('inf')))
 
         # 非支配排序
         fronts, ranks = non_dominated_sorting(fitness)
@@ -635,28 +702,27 @@ def nsga2_optimize(logic_blocks1, logic_blocks2, df, device_flops, mem_limit, ba
         # 如果没有前沿，跳过这一代
         if not fronts or not any(fronts):
             print(f"第 {gen} 代: 没有找到前沿")
-            population = initialize_population(num_blocks, num_cuts, pop_size,fixed_cut)
+            population = initialize_population(num_blocks, num_cuts, pop_size,fixed_cuts)
             continue
 
         # 计算拥挤度
         crowding = calculate_crowding(fitness, fronts)
-
         # 选择父代 (锦标赛选择)
         parents = tournament_selection(population, fitness, ranks, crowding, pop_size)
-
         # 生成子代
         offspring = []
         while len(offspring) < pop_size:
             # 选择两个父代
             if len(parents) < 2:
-                parents.extend(initialize_population(num_blocks, num_cuts, max(2, pop_size - len(parents)),fixed_cut))
+                parents.extend(initialize_population(num_blocks, num_cuts, max(2, pop_size - len(parents)),fixed_cuts))
 
             p1, p2 = random.sample(parents, 2)
-
             # 交叉
             if random.random() < crossover_rate:
                 try:
-                    c1, c2 = crossover(p1, p2, num_blocks, num_cuts)
+                    c1, c2 = crossover(p1, p2, num_blocks, num_cuts,fixed_cuts)
+                    # print(f'crossoverc1:{c1},c2:{c2}')
+
                 except Exception as e:
                     print(f"交叉时出错: {e}")
                     c1, c2 = p1[:], p2[:]
@@ -665,9 +731,11 @@ def nsga2_optimize(logic_blocks1, logic_blocks2, df, device_flops, mem_limit, ba
 
             # 变异
             if random.random() < mutation_rate:
-                c1 = mutate(c1, num_blocks, num_cuts)
+                c1 = mutate(c1, num_blocks, num_cuts,fixed_cuts)
+                # print(f'mutate(c1):{c1}')
             if random.random() < mutation_rate:
-                c2 = mutate(c2, num_blocks, num_cuts)
+                c2 = mutate(c2, num_blocks, num_cuts,fixed_cuts)
+                # print(f'mutate(c2):{c2}')
 
             # 如果子代数量超过种群大小，只取所需数量
             if len(offspring) + 2 <= pop_size:
@@ -700,9 +768,8 @@ def nsga2_optimize(logic_blocks1, logic_blocks2, df, device_flops, mem_limit, ba
                 f"第 {gen} 代: 前沿大小 {len(fronts[0]) if fronts and fronts[0] else 0}, 最小延迟 {min_delay:.2f}, 重复个体数 {duplicate_count}")
 
     # 4. 返回帕累托最优解和块信息
-    return population, block_info
-
-def initialize_population(num_blocks, num_cuts, pop_size, fixed_cut):
+    return population, block_info, fixed_cuts, new_logic_blocks
+def initialize_population(num_blocks, num_cuts, pop_size, fixed_cuts):
     """
     初始化种群（避开固定切割点）
     """
@@ -712,7 +779,7 @@ def initialize_population(num_blocks, num_cuts, pop_size, fixed_cut):
             individual = []
         else:
             # 生成候选位置（排除固定切割点）
-            candidate_positions = [i for i in range(1, num_blocks) if i != fixed_cut]  # 修改点
+            candidate_positions = [i for i in range(1, num_blocks) if i not in fixed_cuts]  # 修改点
             # 确保切割点不重复且避开固定点
             cut_points = sorted(random.sample(candidate_positions, num_cuts))  # 修改点
             individual = cut_points
@@ -720,37 +787,62 @@ def initialize_population(num_blocks, num_cuts, pop_size, fixed_cut):
         population.append(individual)
     return population
 
-
-def evaluate_individual(cut_points, fixed_cut,block_info, device_flops, mem_limit, bandwidth_bps):
+def evaluate_individual2(ind, big_block_index, block_info, device_flops, mem_limit, bandwidth_bps):
     """
     评估个体的适应度
     """
-    try:
-        num_blocks = len(block_info)
-        num_devices = len(device_flops)
-        device_list = list(device_flops.keys())
-        all_cuts = sorted(cut_points + [fixed_cut])  # 修改点：加入固定切割点
-        # 1. 根据切割点划分段落
-        segments = []
-        start = 0
-        for cut in all_cuts:
-            segments.append(list(range(start, cut)))
-            start = cut
-        segments.append(list(range(start, num_blocks)))
+    cut_points = ind.copy( )
+    num_blocks = len(block_info)
+    num_devices = len(device_flops)
+    device_list = list(device_flops.keys())
+    cut_points.append(big_block_index)
+    cut_points.append(big_block_index+1)
 
-        num_segments = len(segments)
+    all_cuts = sorted(list(set(cut_points)))  # 修改点：加入固定切割点
 
-        # 段落数量应该等于设备数量
-        if num_segments != num_devices:
-            return (float('inf'), float('inf'), float('inf'), float('inf'))
+    # print(f'all_cuts:{all_cuts}')
+    # 1. 根据切割点划分段落
+    segments = []
+    start = 0
+    for cut in all_cuts:
+        segments.append(list(range(start, cut)))
+        start = cut
+    segments.append(list(range(start, num_blocks)))
+    # print(f'segments:{segments}')
+    #
+    # num_segments = len(segments)
+    #
+    # # 段落数量应该等于设备数量
+    # if num_segments != num_devices:
+    #     return (float('inf'), float('inf'), float('inf'), float('inf'))
 
-        # 2. 计算每个段落的资源需求
-        segment_stats = []
-        for seg in segments:
-            # 确保 seg 是整数索引列表
-            if not isinstance(seg, list) or not all(isinstance(i, int) for i in seg):
-                return (float('inf'),) * 4
-
+    # 2. 计算每个段落的资源需求
+    segment_stats = []
+    for seg in segments:
+        # 确保 seg 是整数索引列表
+        if not isinstance(seg, list) or not all(isinstance(i, int) for i in seg):
+            return (float('inf'),) * 4
+        if seg[0] == big_block_index:
+            total_flops = sum(block_info[i]['flops'] for i in seg)/2
+            total_memory = sum(block_info[i]['total_memory'] for i in seg)/2
+            if seg:  # 确保段落不为空
+                last_block_idx = seg[-1]
+                output_size = block_info[last_block_idx]['output_size']/2
+            else:
+                output_size = 0
+            segment_stats.append({
+                'name':f'{seg[0]}_{seg[-1]}_1',
+                'flops': total_flops,
+                'memory': total_memory,
+                'output_size': output_size
+            })
+            segment_stats.append({
+                'name':f'{seg[0]}_{seg[-1]}_2',
+                'flops': total_flops,
+                'memory': total_memory,
+                'output_size': output_size
+            })
+        else:
             total_flops = sum(block_info[i]['flops'] for i in seg)
             total_memory = sum(block_info[i]['total_memory'] for i in seg)
 
@@ -762,69 +854,201 @@ def evaluate_individual(cut_points, fixed_cut,block_info, device_flops, mem_limi
                 output_size = 0
 
             segment_stats.append({
+                'name': f'{seg[0]}_{seg[-1]}',
                 'flops': total_flops,
                 'memory': total_memory,
                 'output_size': output_size
             })
-        segment_stats_sorted = sorted(segment_stats, key=lambda x: x['flops'])
-        # 3. 将段落分配给设备（按顺序）
-        device_stats = []
-        for i, stats in enumerate(segment_stats_sorted):
-            device = device_list[i]
-            flops = device_flops[device]
-            compute_time = stats['flops'] / flops if flops > 0 else float('inf')
-            device_stats.append({
-                'compute_time': compute_time,
-                'memory': stats['memory'],
-                'output_size': stats['output_size'],
-                'device': device
-            })
+    segment_stats_sorted = sorted(segment_stats, key=lambda x: x['flops'])
+    # 3. 将段落分配给设备（按顺序）
+    device_stats = []
+    for i, stats in enumerate(segment_stats_sorted):
+        device = device_list[i]
+        flops = device_flops[device]
+        compute_time = stats['flops'] / flops if flops > 0 else float('inf')
+        device_stats.append({
+            'name': stats['name'],
+            'compute_time': compute_time,
+            'memory': stats['memory'],
+            'output_size': stats['output_size'],
+            'flops':stats['flops'],
+            'device': device
+        })
 
-        # 4. 计算目标函数
-        # 目标1: 总延迟 (关键路径时间)
-        if not device_stats:
+    # 4. 计算目标函数
+    # 目标1: 总延迟 (关键路径时间)
+    if not device_stats:
+        return (float('inf'),) * 4
+
+    delays = [device_stats[0]['compute_time']]
+    comm_times = []
+
+    # 计算通信时间
+    for i in range(len(device_stats) - 1):
+        comm_size = device_stats[i]['output_size']
+        comm_time = comm_size / bandwidth_bps
+        comm_times.append(comm_time)
+
+    # 计算流水线延迟
+    for i in range(1, len(device_stats)):
+        prev_delay = delays[i - 1]
+        comm_delay = comm_times[i - 1] if i - 1 < len(comm_times) else 0
+        start_time = max(prev_delay, prev_delay + comm_delay)
+        delays.append(start_time + device_stats[i]['compute_time'])
+
+    total_delay = delays[-1] if delays else 0
+
+    # 目标2: 总通信量 (字节)
+    total_comm = sum(device_stats[i]['output_size'] for i in range(len(device_stats) - 1))
+
+    # 目标3: 内存超限量 (字节)
+    mem_over = 0
+    for stats in device_stats:
+        if stats['memory'] > mem_limit:
+            mem_over += (stats['memory'] - mem_limit)
+    # print(f'device_stats:{device_stats}')
+    # 目标4: 负载均衡 (计算时间方差)
+    compute_times = [stats['compute_time'] for stats in device_stats]
+    if len(compute_times) > 1:
+        compute_var = np.std(compute_times)
+    else:
+        compute_var = 0
+
+    return (total_delay, total_comm, mem_over, compute_var,device_stats)
+
+
+
+def evaluate_individual(ind, big_block_index, block_info, device_flops, mem_limit, bandwidth_bps):
+    """
+    评估个体的适应度
+    """
+    cut_points = ind.copy( )
+    num_blocks = len(block_info)
+    num_devices = len(device_flops)
+    device_list = list(device_flops.keys())
+    cut_points.append(big_block_index)
+    cut_points.append(big_block_index+1)
+
+    all_cuts = sorted(list(set(cut_points)))  # 修改点：加入固定切割点
+
+    # print(f'all_cuts:{all_cuts}')
+    # 1. 根据切割点划分段落
+    segments = []
+    start = 0
+    for cut in all_cuts:
+        segments.append(list(range(start, cut)))
+        start = cut
+    segments.append(list(range(start, num_blocks)))
+    # print(f'segments:{segments}')
+    #
+    # num_segments = len(segments)
+    #
+    # # 段落数量应该等于设备数量
+    # if num_segments != num_devices:
+    #     return (float('inf'), float('inf'), float('inf'), float('inf'))
+
+    # 2. 计算每个段落的资源需求
+    segment_stats = []
+    for seg in segments:
+        # 确保 seg 是整数索引列表
+        if not isinstance(seg, list) or not all(isinstance(i, int) for i in seg):
             return (float('inf'),) * 4
-
-        delays = [device_stats[0]['compute_time']]
-        comm_times = []
-
-        # 计算通信时间
-        for i in range(len(device_stats) - 1):
-            comm_size = device_stats[i]['output_size']
-            comm_time = comm_size / bandwidth_bps
-            comm_times.append(comm_time)
-
-        # 计算流水线延迟
-        for i in range(1, len(device_stats)):
-            prev_delay = delays[i - 1]
-            comm_delay = comm_times[i - 1] if i - 1 < len(comm_times) else 0
-            start_time = max(prev_delay, prev_delay + comm_delay)
-            delays.append(start_time + device_stats[i]['compute_time'])
-
-        total_delay = delays[-1] if delays else 0
-
-        # 目标2: 总通信量 (字节)
-        total_comm = sum(device_stats[i]['output_size'] for i in range(len(device_stats) - 1))
-
-        # 目标3: 内存超限量 (字节)
-        mem_over = 0
-        for stats in device_stats:
-            if stats['memory'] > mem_limit:
-                mem_over += (stats['memory'] - mem_limit)
-        # print(f'device_stats:{device_stats}')
-        # 目标4: 负载均衡 (计算时间方差)
-        compute_times = [stats['compute_time'] for stats in device_stats]
-        if len(compute_times) > 1:
-            compute_var = np.std(compute_times)
+        if seg[0] == big_block_index:
+            total_flops = sum(block_info[i]['flops'] for i in seg)/2
+            total_memory = sum(block_info[i]['total_memory'] for i in seg)/2
+            if seg:  # 确保段落不为空
+                last_block_idx = seg[-1]
+                output_size = block_info[last_block_idx]['output_size']/2
+            else:
+                output_size = 0
+            segment_stats.append({
+                'name':f'{seg[0]}_{seg[-1]}_1',
+                'flops': total_flops,
+                'memory': total_memory,
+                'output_size': output_size
+            })
+            segment_stats.append({
+                'name':f'{seg[0]}_{seg[-1]}_2',
+                'flops': total_flops,
+                'memory': total_memory,
+                'output_size': output_size
+            })
         else:
-            compute_var = 0
+            total_flops = sum(block_info[i]['flops'] for i in seg)
+            total_memory = sum(block_info[i]['total_memory'] for i in seg)
 
-        return (total_delay, total_comm, mem_over, compute_var)
+            # 获取最后一块的输出大小
+            if seg:  # 确保段落不为空
+                last_block_idx = seg[-1]
+                output_size = block_info[last_block_idx]['output_size']
+            else:
+                output_size = 0
 
-    except Exception as e:
-        print(f"评估个体时出错: {e}")
-        return (float('inf'), float('inf'), float('inf'), float('inf'))
-def crossover(p1, p2, num_blocks, num_cuts):
+            segment_stats.append({
+                'name': f'{seg[0]}_{seg[-1]}',
+                'flops': total_flops,
+                'memory': total_memory,
+                'output_size': output_size
+            })
+    segment_stats_sorted = sorted(segment_stats, key=lambda x: x['flops'])
+    # 3. 将段落分配给设备（按顺序）
+    device_stats = []
+    for i, stats in enumerate(segment_stats_sorted):
+        device = device_list[i]
+        flops = device_flops[device]
+        compute_time = stats['flops'] / flops if flops > 0 else float('inf')
+        device_stats.append({
+            'compute_time': compute_time,
+            'memory': stats['memory'],
+            'output_size': stats['output_size'],
+            'device': device
+        })
+
+    # 4. 计算目标函数
+    # 目标1: 总延迟 (关键路径时间)
+    if not device_stats:
+        return (float('inf'),) * 4
+
+    delays = [device_stats[0]['compute_time']]
+    comm_times = []
+
+    # 计算通信时间
+    for i in range(len(device_stats) - 1):
+        comm_size = device_stats[i]['output_size']
+        comm_time = comm_size / bandwidth_bps
+        comm_times.append(comm_time)
+
+    # 计算流水线延迟
+    for i in range(1, len(device_stats)):
+        prev_delay = delays[i - 1]
+        comm_delay = comm_times[i - 1] if i - 1 < len(comm_times) else 0
+        start_time = max(prev_delay, prev_delay + comm_delay)
+        delays.append(start_time + device_stats[i]['compute_time'])
+
+    total_delay = delays[-1] if delays else 0
+
+    # 目标2: 总通信量 (字节)
+    total_comm = sum(device_stats[i]['output_size'] for i in range(len(device_stats) - 1))
+
+    # 目标3: 内存超限量 (字节)
+    mem_over = 0
+    for stats in device_stats:
+        if stats['memory'] > mem_limit:
+            mem_over += (stats['memory'] - mem_limit)
+    # print(f'device_stats:{device_stats}')
+    # 目标4: 负载均衡 (计算时间方差)
+    compute_times = [stats['compute_time'] for stats in device_stats]
+    if len(compute_times) > 1:
+        compute_var = np.std(compute_times)
+    else:
+        compute_var = 0
+
+    return (total_delay, total_comm, mem_over, compute_var)
+
+    # except Exception as e:
+    #     print(f"评估个体时出错22: {e}")
+    #     return (float('inf'), float('inf'), float('inf'), float('inf'))
+def crossover(p1, p2, num_blocks, num_cuts,fixed_cuts):
     """交叉操作 - 确保切割点不重复"""
     if num_cuts == 0:
         return [], []
@@ -848,7 +1072,7 @@ def crossover(p1, p2, num_blocks, num_cuts):
     def complete_individual(ind, num_cuts, num_blocks):
         if len(ind) < num_cuts:
             # 获取所有可能的切割点
-            all_positions = [p for p in range(1, num_blocks) if p != fixed_cut]  # 修改点
+            all_positions = [p for p in range(1, num_blocks) if p not in fixed_cuts]
             # 移除已存在的点
             available = [p for p in all_positions if p not in ind]
             # 随机选择补充点
@@ -864,7 +1088,7 @@ def crossover(p1, p2, num_blocks, num_cuts):
     return child1, child2
 
 
-def mutate(individual, num_blocks, num_cuts):
+def mutate(individual, num_blocks, num_cuts,fixed_cuts):
     """变异操作 - 确保切割点不重复"""
     if num_cuts == 0:
         return individual
@@ -873,17 +1097,30 @@ def mutate(individual, num_blocks, num_cuts):
     new_individual = individual[:]
 
     # 随机选择一个切割点进行变异
-    idx = random.randint(0, num_cuts - 1)
+    idx = random.randint(0, num_cuts-1)
 
     # 生成新的切割点位置，确保不重复且在有效范围内
     possible_positions = [i for i in range(1, num_blocks)
-                         if i not in new_individual and i != fixed_cut]  # 修改点
+                         if i not in new_individual and i not in fixed_cuts]
     if possible_positions:
         new_cut = random.choice(possible_positions)
         new_individual[idx] = new_cut
         new_individual.sort()
-
+    # new_individual = sorted(set(new_individual))
+    # def complete_individual(ind, num_cuts, num_blocks):
+    #     if len(ind) < num_cuts+2:
+    #         # 获取所有可能的切割点
+    #         all_positions = [p for p in range(1, num_blocks) if p not in fixed_cuts]
+    #         # 移除已存在的点
+    #         available = [p for p in all_positions if p not in ind]
+    #         # 随机选择补充点
+    #         if available:
+    #             additional = random.sample(available, num_cuts - len(ind))
+    #             ind.extend(additional)
+    #             ind.sort()
+    #     return ind
     return new_individual
+    # return complete_individual(new_individual,num_cuts, num_blocks)
 def non_dominated_sorting(fitness):
     """非支配排序"""
     pop_size = len(fitness)
@@ -1077,22 +1314,41 @@ if __name__ == "__main__":
     print("关键边后的逻辑块blocks:", blocks)
     df = profile_and_tabulate(model)
     # 1.2 滑动窗口合并
-    merged,merged_topk,logical_layers = find_bottleneck_segments(df, blocks,window=2,thresh_ratio=1.8)
+    merged,merged_topk,logical_layers = find_bottleneck_segments(df, blocks,thresh_ratio=1.8)
     print("合并后的瓶颈块merged:", merged)
     print("数据量降序排序的瓶颈块merged_topk:",merged_topk)
     print("包含合并瓶颈块以及前面逻辑块的完整层logical_layers:", logical_layers)
 
     cases = case_select(df, merged_topk)
     print(f'验证的瓶颈层案例cases：{cases}')
-    # start_time = time.time()
 
-    print(f'预测精度后的cases{evaluate_precision_decay(cases)}')
+    # start_time = time.time()
+    # cases = evaluate_precision_decay(cases)
+    # print(f'预测精度后的cases{cases}')
+    # # # print(f'预测精度后的cases{evaluate_precision_decay(cases)}')
     # end_time = time.time()
     # print(f'调用精度函数耗时{end_time - start_time}s')
+
+    images_dir = r"../11"
+    ground_truth_path = r"ground_truth_label_5h.txt"
+
+    # 创建评估器
+    evaluator = MultiModelEvaluator(
+        cases=cases,
+        images_dir=images_dir,
+        ground_truth_path=ground_truth_path,
+        batch_size=32  # 更大的批处理大小
+    )
+
+    # 执行评估
+    results = evaluator.evaluate()
+
+
     #
     # accuracy_list = [75.68,74.90,74.91]
     # for i in range(3):
     #     cases[i]['accuracy']=accuracy_list[i]
+
     max_case = max(cases, key=lambda x: x['accuracy'])
     print(max_case)
 
@@ -1104,24 +1360,24 @@ if __name__ == "__main__":
             index_front = i
     index_back = index_front+1
 
-    front_block = logical_layers[:index_front]
-    back_block = logical_layers[index_back:]
+    # front_block = logical_layers[:index_front]
+    # back_block = logical_layers[index_back:]
     device_flops = {
-        'pc_cpu': 500e9,
-        'jetson1': 472e9,
-        'jetson2': 472e9,
         'rpi5_1': 320e9,
         'rpi5_2': 320e9,
-        'rpi5_3': 320e9
+        'rpi5_3': 320e9,
+        'jetson1': 472e9,
+        'jetson2': 472e9,
+        'jetson3': 472e9,
+        'pc_cpu': 500e9,
     }
     mem_limit = 4 * 1024 ** 2  # 4GB
-    bandwidth_bps = 5e7  # 1MB/s
-    merged_blocks = front_block + back_block
-    fixed_cut = len(front_block)  # 固定切割点位置
+    bandwidth_bps = 4e6  # 1MB/s
+
     # 5. 运行优化
-    pareto_solutions, block_info = nsga2_optimize(
-        logic_blocks1=front_block,
-        logic_blocks2=back_block,
+    pareto_solutions, block_info, fixed_cuts, new_logic_blocks = nsga2_optimize(
+        logic_blocks=logical_layers,
+        big_block_index=index_front,
         df=df,
         device_flops=device_flops,
         mem_limit=mem_limit,
@@ -1129,72 +1385,37 @@ if __name__ == "__main__":
         pop_size=50,
         ngen=100
     )
+    # print(pareto_solutions)
     if pareto_solutions:
         print(f"找到 {len(pareto_solutions)} 个帕累托最优解")
 
         # 按总延迟排序
         pareto_solutions.sort(
-            key=lambda ind: evaluate_individual(ind, fixed_cut, block_info, device_flops, mem_limit, bandwidth_bps)[0]
+            key=lambda ind: evaluate_individual(ind, index_front, block_info, device_flops, mem_limit, bandwidth_bps)[0]
         )
 
         # 输出前3个最优解
         for i, solution in enumerate(pareto_solutions[:3]):
-            # 实际切割点数量（优化切割点+固定切割点）
-            num_actual_cuts = len(solution) + 1  # 优化切割点 + 固定切割点
+            # 合并所有切割点
 
-            # 段落数 = 切割点数 + 1
-            num_segments = num_actual_cuts + 1
-
-            delay, comm, mem_over, balance = evaluate_individual(
-                solution, fixed_cut, block_info, device_flops, mem_limit, bandwidth_bps
+            delay, comm, mem_over, balance,device_stats = evaluate_individual2(
+                solution, index_front, block_info, device_flops, mem_limit, bandwidth_bps
             )
+            solution.append(index_front)
+            solution.append(index_front+1)
 
             print(f"\n方案 {i + 1}:")
-            print(f"优化切割点数量: {len(solution)}")
-            print(f"总切割点数量 (含固定点): {num_actual_cuts}")
-            print(f"段落数量: {num_segments}")
             print(f"总延迟: {delay:.4f}秒")
             print(f"总通信量: {comm / 1e6:.2f}MB")
             print(f"内存超限: {mem_over / 1e6:.2f}MB")
             print(f"负载均衡方差: {balance:.4f}")
 
-            # 显示所有切割点（优化点+固定点）
-            all_cuts = sorted(solution + [fixed_cut])
-            print(f"所有切割点位置: {all_cuts}")
-            print(f"固定切割点位置: {fixed_cut} (前块结束位置)")
+            # 显示所有切割点
+            print(f"所有切割点位置: {sorted(solution)}")
+            print(f"固定切割点位置: {fixed_cuts}")
+            for sta in device_stats:
+                print(f"{logical_layers[int(sta['name'].split('_')[0]):int(sta['name'].split('_')[1])+1]}被分配在{sta['device']}上")
+            print(f'切割段落数据：{device_stats}')
 
-            # 划分段落（包含固定切割点）
-            segments = []
-            start = 0
-            for cut in all_cuts:
-                segments.append(list(range(start, cut)))
-                start = cut
-            segments.append(list(range(start, len(block_info))))
-
-            # 分配设备
-            device_list = list(device_flops.keys())
-            total_blocks = len(front_block) + len(back_block)
-
-            for j, seg in enumerate(segments):
-                device = device_list[j]
-                if seg:  # 确保段落不为空
-                    # 计算段落中的前块和后块
-                    front_blocks = [idx for idx in seg if idx < fixed_cut]
-                    back_blocks = [idx for idx in seg if idx >= fixed_cut]
-
-                    desc = ""
-                    if front_blocks:
-                        desc += f"前块: {front_blocks[0]}-{front_blocks[-1]} "
-                    if back_blocks:
-                        # 转换到后块中的索引
-                        back_start = back_blocks[0] - fixed_cut
-                        back_end = back_blocks[-1] - fixed_cut
-                        desc += f"后块: {back_start}-{back_end}"
-
-                    print(f"段落 {j + 1} (设备: {device}): {desc}")
-                else:
-                    print(f"段落 {j + 1} (设备: {device}): 空段落")
-
-            print(f"总块数: 前块 {len(front_block)} + 后块 {len(back_block)} = {total_blocks}")
     else:
         print("未找到可行解")

@@ -173,8 +173,6 @@ def build_logic_blocks(fx_net):
 
     # --- 步骤 1.2：滑动窗口合并检测瓶颈块 ---
 
-
-
 def preprocess_blocks(logic_blocks, df):
     """预处理逻辑块信息"""
     block_info = []
@@ -204,11 +202,6 @@ def preprocess_blocks(logic_blocks, df):
             'total_memory': weight_mem + bias_mem + peak_activation
         })
     return block_info
-
-
-
-
-
 
 def nsga2_optimize(logic_blocks, df, device_flops, mem_limit, bandwidth_bps,
                    pop_size=50, ngen=100, threshold=0.01, crossover_rate=0.8, mutation_rate=0.1):

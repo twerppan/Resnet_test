@@ -1,5 +1,5 @@
 import time
-from torchvision.models import resnet50
+from torchvision.models import resnet50,ResNet50_Weights
 import itertools
 import torch
 import torch.nn as nn
@@ -14,7 +14,11 @@ from PIL import Image
 from torch.fx import symbolic_trace, GraphModule
 import random
 import numpy as np
-
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import concurrent.futures
+import multiprocessing
+from functools import partial
 # --- 步骤 1.1：关键路径判断算法识别关键路径。 & 将不可分割节点合并为逻辑块 ---
 def find_critical_edges_dag(edges):
     in_degree = defaultdict(int)
@@ -480,109 +484,207 @@ class ImageDataset(torch.utils.data.Dataset):
         input_tensor = self.preprocess(img)
         return input_tensor, self.image_files[idx]
 
-def evaluate_precision_decay(cases):
-    # 配置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 加载预训练的resnet50模型并移动到GPU
-    model = resnet50(pretrained=True).to(device)
-    model.eval()
+class MultiModelEvaluator:
+    def __init__(self, cases, images_dir, ground_truth_path, batch_size=64):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.cases = cases
+        self.images_dir = images_dir
+        self.ground_truth_path = ground_truth_path
+        self.batch_size = batch_size
 
-    # 图像预处理Transform
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+        # 加载原始模型
+        self.base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).to(self.device)
+        self.base_model.eval()
 
-    # 预先创建所有需要的预测文件
-    predict_files = {}
-    for case in cases:
-        predict_txt = f"test5h/CutPredict{case['cut_layer']} -- {case['paste_layer']}_5h.txt"
-        with open(predict_txt, 'w') as f:
-            pass  # 创建文件
-        predict_files[case['cut_layer'], case['paste_layer']] = predict_txt
+        # 创建所有切割模型
+        self.models = {}
+        for case in cases:
+            key = f"{case['cut_layer']}--{case['paste_layer']}"
+            model = self.create_cut_model(case)
+            self.models[key] = {
+                'model': model,
+                'case': case,
+                'predictions': []
+            }
 
-    # 遍历目录中的所有图片文件
-    images_dir = r"E:\11"
-    image_files = [f for f in os.listdir(images_dir) if f.endswith(".JPEG")]
-    total_images = len(image_files)
+        # 图像预处理
+        self.preprocess = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
-    # 创建一个图像数据集并使用 DataLoader 加载
-    dataset = ImageDataset(image_files, images_dir, preprocess)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+        # 加载图像文件列表
+        self.image_files = [f for f in os.listdir(images_dir) if f.endswith(".JPEG")]
+        self.dataset = ImageDataset(self.image_files, images_dir, self.preprocess)
+        self.dataloader = DataLoader(
+            self.dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
 
-    # 初始化预测结果字典
-    predictions = {case['cut_layer'] + ' -- ' + case['paste_layer']: [] for case in cases}
+        # 加载真实标签
+        self.ground_truth = self.load_ground_truth()
 
-    # 遍历所有图像并进行预测
-    with torch.no_grad():
-        for inputs, img_names in dataloader:
-            inputs = inputs.to(device)
-            for case in cases:
-                split_fn = create_split_fn(model, case['cut_layer'], case['paste_layer'])
-                outputs = split_fn(inputs)
-                probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
-                for img_name, predicted_class in zip(img_names, predicted_classes):
-                    predictions[case['cut_layer'] + ' -- ' + case['paste_layer']].append((img_name.split('.')[0], predicted_class))
+    def create_cut_model(self, case):
+        """创建切割模型（不复制基础权重）"""
+        # 使用基础模型的权重引用，避免复制
+        model = resnet50(weights=None).to(self.device)
 
-    # 写入预测结果到文件
-    for case in cases:
-        predict_txt = predict_files.get((case['cut_layer'], case['paste_layer']))
-        if predict_txt is not None:
-            with open(predict_txt, 'a') as f:
-                for img_name, predicted_class in predictions[case['cut_layer'] + ' -- ' + case['paste_layer']]:
-                    f.write(f"{img_name}: {predicted_class}\n")
-            print(f"{case['cut_layer']} -- {case['paste_layer']}5h图像的预测结果已写入")
+        # 共享基础权重
+        for param_src, param_dest in zip(self.base_model.parameters(), model.parameters()):
+            param_dest.data = param_src.data
+            param_dest.requires_grad = False
 
-            correct = 0
-            total = 0
+        # 应用切割
+        split_fn = create_split_fn(model, case['cut_layer'], case['paste_layer'])
+        return split_fn
 
-            # 读取真实类别和预测类别文件进行比较
-            with open(r"ground_truth_label_5h.txt", 'r') as f_label, open(predict_txt, 'r') as f_predict:
-                # 逐行读取并比较
-                for line_label, line_predict in zip(f_label, f_predict):
-                    # 解析真实类别
-                    img_name_label, true_class = line_label.strip().split(': ')
-                    # 解析预测类别
-                    img_name_predict, predicted_class = line_predict.strip().split(': ')
-                    # 确保比较的是同一张图片
-                    if img_name_label != img_name_predict:
-                        print(f"图片名称不匹配：{img_name_label} vs {img_name_predict}")
-                        continue
-                    # 判断预测是否正确
-                    if true_class == predicted_class:
-                        correct += 1
-                    total += 1
+    def load_ground_truth(self):
+        """加载真实标签"""
+        ground_truth = {}
+        with open(self.ground_truth_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(': ')
+                if len(parts) >= 2:
+                    img_name = parts[0]
+                    true_class = parts[1]
+                    ground_truth[img_name] = true_class
+        return ground_truth
+
+    def evaluate(self):
+        """执行评估"""
+        start_time = time.time()
+
+        # 使用大batch一次处理所有模型
+        with torch.no_grad():
+            for inputs, img_names in tqdm(self.dataloader, desc="处理批次"):
+                inputs = inputs.to(self.device, non_blocking=True)
+
+                # 对每个模型执行推理
+                for key, model_info in self.models.items():
+                    outputs = model_info['model'](inputs)
+                    probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                    predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
+
+                    # 存储预测结果
+                    for img_name, pred_class in zip(img_names, predicted_classes):
+                        img_base = os.path.splitext(img_name)[0]
+                        model_info['predictions'].append((img_base, str(pred_class)))
+
+        # 计算准确率并保存结果
+        for key, model_info in self.models.items():
+            case = model_info['case']
+            predict_txt = f"test5h/CutPredict{case['cut_layer']} -- {case['paste_layer']}_5h.txt"
+
+            # 写入预测文件
+            with open(predict_txt, 'w') as f:
+                for img_base, pred_class in model_info['predictions']:
+                    f.write(f"{img_base}: {pred_class}\n")
 
             # 计算准确率
-            accuracy = correct / total if total != 0 else 0
+            correct = 0
+            total = 0
+            for img_base, pred_class in model_info['predictions']:
+                true_class = self.ground_truth.get(img_base)
+                if true_class and true_class == pred_class:
+                    correct += 1
+                total += 1
+
+            accuracy = correct / total if total > 0 else 0
             case['accuracy'] = accuracy
-            print(f"模型准确率: {accuracy:.2%} ({correct}/{total})")
+            print(f"切割方案 {key} 准确率: {accuracy:.4f} ({correct}/{total})")
 
-    return cases
+        elapsed = time.time() - start_time
+        print(f"评估完成! 总耗时: {elapsed:.2f}秒")
+        return self.cases
 
-def preprocess_blocks(logic_blocks, df):
-    """预处理逻辑块信息"""
-    block_info = []
+
+def preprocess_blocks(logic_blocks, df, input_size=0):
+    """预处理逻辑块信息（支持分支结构）"""
+    # 步骤1: 构建块级DAG
+    block_edges = []
+    block_to_index = {}
+    node_to_block = {}
+
+    # 建立节点到块的映射
+    for block_idx, block in enumerate(logic_blocks):
+        block_to_index[tuple(block)] = block_idx
+        for node in block:
+            node_to_block[node] = block_idx
+
+    # 构建块间连接关系
+    for i in range(len(logic_blocks)):
+        current_block = logic_blocks[i]
+        last_node = current_block[-1]
+
+        # 查找当前块最后一个节点的所有后继节点
+        last_node_row = df[df['node'] == last_node].iloc[0]
+        if last_node_row['edge_to_next'] is None:
+            continue
+
+        successor_node = last_node_row['edge_to_next'][1]
+        if successor_node in node_to_block:
+            successor_block_idx = node_to_block[successor_node]
+            if successor_block_idx != i:  # 避免自环
+                block_edges.append((i, successor_block_idx))
+
+    # 步骤2: 计算每个块的内部峰值和输出大小
+    block_peaks = []
+    block_output_sizes = []
+
     for block in logic_blocks:
-        # 获取当前块的所有节点数据
+        block_df = df[df['node'].isin(block)].sort_values('idx')
+
+        if block_df.empty:
+            block_peaks.append(0)
+            block_output_sizes.append(0)
+            continue
+
+        # 计算块内峰值激活（考虑输入-输出叠加）
+        intra_peak = 0
+        prev_output = input_size if block == logic_blocks[0] else 0
+
+        for _, row in block_df.iterrows():
+            # 节点计算时瞬时内存 = 输入激活 + 输出激活
+            instant_activation = prev_output + row['size']
+            if instant_activation > intra_peak:
+                intra_peak = instant_activation
+            prev_output = row['size']  # 当前输出成为下一节点的输入
+
+        block_peaks.append(intra_peak)
+        block_output_sizes.append(block_df.iloc[-1]['size'])
+
+    # 步骤3: 处理分支结构
+    block_info = []
+
+    for block_idx, block in enumerate(logic_blocks):
         block_df = df[df['node'].isin(block)]
 
-        # 计算块的总计算量 (FLOPs)
-        total_flops = block_df['flops (MFLOPs)'].sum() * 1e6
+        # 查找当前块的所有直接后继块
+        successors = [v for u, v in block_edges if u == block_idx]
 
-        # 计算块的权重和偏置内存 (字节)
+        if len(successors) > 1:  # 存在分支
+            # 计算每个分支的峰值内存
+            branch_peaks = [block_peaks[succ_idx] for succ_idx in successors]
+
+            # 并行峰值 = 当前块输出 + 所有分支峰值之和
+            parallel_peak = block_output_sizes[block_idx] + sum(branch_peaks)
+
+            # 最终峰值 = max(块内峰值, 并行峰值)
+            peak_activation = max(block_peaks[block_idx], parallel_peak)
+        else:
+            peak_activation = block_peaks[block_idx]  # 无分支使用块内峰值
+
+        # 计算块的其他信息
+        total_flops = block_df['flops (MFLOPs)'].sum() * 1e6
         weight_mem = block_df['weight_memory'].sum()
         bias_mem = block_df['bias_memory'].sum()
-
-        # 计算块的峰值激活内存 (字节)
-        peak_activation = block_df['size'].max()
-
-        # 块的输出大小 (最后一个节点的输出)
-        output_size = block_df.iloc[-1]['size']
+        output_size = block_output_sizes[block_idx]
 
         block_info.append({
             'flops': total_flops,
@@ -592,6 +694,7 @@ def preprocess_blocks(logic_blocks, df):
             'output_size': output_size,
             'total_memory': weight_mem + bias_mem + peak_activation
         })
+
     return block_info
 
 # --- 步骤 1.4：NSGA-II 多目标优化寻找切割方案的帕累托前沿 ---
@@ -616,7 +719,7 @@ def nsga2_optimize(logic_blocks, big_block_index, df, device_flops, mem_limit, b
 
     # 1. 预处理逻辑块信息
     block_info = preprocess_blocks(logic_blocks, df)
-
+    print(f'block_info:{block_info}')
     split_ratio = 0.5  # 等分
     big_block_part1 = {
         'name': "bottleneck_part1",
@@ -835,6 +938,7 @@ def evaluate_individual2(ind, big_block_index, block_info, device_flops, mem_lim
             'compute_time': compute_time,
             'memory': stats['memory'],
             'output_size': stats['output_size'],
+            'flops':stats['flops'],
             'device': device
         })
 
@@ -1284,15 +1388,34 @@ if __name__ == "__main__":
 
     cases = case_select(df, merged_topk)
     print(f'验证的瓶颈层案例cases：{cases}')
-    # start_time = time.time()
 
-    print(f'预测精度后的cases{evaluate_precision_decay(cases)}')
+    # start_time = time.time()
+    # cases = evaluate_precision_decay(cases)
+    # print(f'预测精度后的cases{cases}')
+    # # # print(f'预测精度后的cases{evaluate_precision_decay(cases)}')
     # end_time = time.time()
     # print(f'调用精度函数耗时{end_time - start_time}s')
+
+    images_dir = r"../11"
+    ground_truth_path = r"ground_truth_label_5h.txt"
+
+    # 创建评估器
+    evaluator = MultiModelEvaluator(
+        cases=cases,
+        images_dir=images_dir,
+        ground_truth_path=ground_truth_path,
+        batch_size=32  # 更大的批处理大小
+    )
+
+    # 执行评估
+    results = evaluator.evaluate()
+
+
     #
     # accuracy_list = [75.68,74.90,74.91]
     # for i in range(3):
     #     cases[i]['accuracy']=accuracy_list[i]
+
     max_case = max(cases, key=lambda x: x['accuracy'])
     print(max_case)
 
@@ -1327,7 +1450,7 @@ if __name__ == "__main__":
         mem_limit=mem_limit,
         bandwidth_bps=bandwidth_bps,
         pop_size=50,
-        ngen=100
+        ngen=50
     )
     # print(pareto_solutions)
     if pareto_solutions:
@@ -1341,9 +1464,6 @@ if __name__ == "__main__":
         # 输出前3个最优解
         for i, solution in enumerate(pareto_solutions[:3]):
             # 合并所有切割点
-
-
-
 
             delay, comm, mem_over, balance,device_stats = evaluate_individual2(
                 solution, index_front, block_info, device_flops, mem_limit, bandwidth_bps
