@@ -179,7 +179,6 @@ def build_logic_blocks(fx_net):
 
     # --- 步骤 1.2：滑动窗口合并检测瓶颈块 ---
 
-
 def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
     """
         merged: 合并后的瓶颈段(节点索引范围)
@@ -313,10 +312,9 @@ def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
 
     return merged, merged_topk, logical_layers
 
-
+#   根据瓶颈段信息得到索引序号对应的层名
 def case_select(df, merged_topk):
 
-    #   根据瓶颈段信息生成切割点配置
     cases = []
     # 遍历每个瓶颈段
     for seg in merged_topk:
@@ -347,7 +345,7 @@ def case_select(df, merged_topk):
             })
 
     return cases
-
+#根据case的边重新划分模型，构建瓶颈块的前、后三部分
 def split_model(model, start_cut, end_cut):
     traced = symbolic_trace(model)
 
@@ -425,7 +423,7 @@ def split_model(model, start_cut, end_cut):
 
     return front_module, mid_module, tail_module
 
-def create_split_fn_4(model, start_layer, end_layer, num_splits=4):
+def create_split_fn_4_grid(model, start_layer, end_layer, num_splits=4):
     front, mid, tail = split_model(model, start_layer, end_layer)
 
     def forward_fn(x):
@@ -605,49 +603,8 @@ def create_split_fn_3_height(model, start_layer, end_layer, num_splits=3):
         return tail(concat_out)
 
     return forward_fn
-def create_split_fn(model, start_layer, end_layer, num_splits=4):
-    front, mid, tail = split_model(model, start_layer, end_layer)
 
-    def forward_fn(x):
-        # 前向传播
-        front_out = front(x)
-
-        # print(f'前向传播后shape：{front_out.shape}')
-
-        # 空间维度分割为4份
-        _, _, h, w = front_out.shape
-        h_chunk = h // 2
-        w_chunk = w // 2
-
-        chunks = [
-            front_out[:, :, :h_chunk, :w_chunk],
-            front_out[:, :, :h_chunk, w_chunk:],
-            front_out[:, :, h_chunk:, :w_chunk],
-            front_out[:, :, h_chunk:, w_chunk:],
-        ]
-
-        # for chunk in chunks:
-        #     print(f'mid前每个子张量shape：{chunk.shape}')
-
-        # 并行处理中间部分
-        mid_outs = [mid(chunk) for chunk in chunks]
-
-        # for mid_out in mid_outs:
-        #     print(f'mid后每个字张量shape{mid_out.shape}')
-
-        # 重新拼接张量
-        top = torch.cat([mid_outs[0], mid_outs[1]], dim=3)
-        bottom = torch.cat([mid_outs[2], mid_outs[3]], dim=3)
-        concat_out = torch.cat([top, bottom], dim=2)
-
-        # print(f'拼接后的shape：{concat_out.shape}')
-        # # 后向传播
-        # print(f'最后shape：{tail(concat_out).shape}')
-
-        return tail(concat_out)
-
-    return forward_fn
-# 定义 ImageDataset 类
+# 定义 ImageDataset 类加载测试数据集
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(self, image_files, images_dir, preprocess):
         self.image_files = image_files
@@ -663,7 +620,7 @@ class ImageDataset(torch.utils.data.Dataset):
         input_tensor = self.preprocess(img)
         return input_tensor, self.image_files[idx]
 
-
+#精度损失评估类
 class MultiModelEvaluator:
     def __init__(self, cases, images_dir, ground_truth_path, batch_size=64):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -684,7 +641,7 @@ class MultiModelEvaluator:
             'split_3_weight': create_split_fn_3_weight,
             'split_4_height': create_split_fn_4_height,
             'split_4_weight': create_split_fn_4_weight,
-            'split_4_grid': create_split_fn_4
+            'split_4_grid': create_split_fn_4_grid
         }
 
         # 创建所有切割模型
@@ -816,6 +773,7 @@ class MultiModelEvaluator:
         print(f"评估完成! 总耗时: {elapsed:.2f}秒")
         return self.cases
 
+#重计算每个块的峰值内存、flops等数据
 def preprocess_blocks(logic_blocks, df, input_size=0):
     """预处理逻辑块信息（支持分支结构）"""
     # 步骤1: 构建块级DAG
@@ -910,6 +868,520 @@ def preprocess_blocks(logic_blocks, df, input_size=0):
     return block_info
 
 
+def generate_and_select_cut_schemes(logic_blocks, big_block_index, block_number, num_devices, top_k=50):
+    """
+    生成切割方案并根据均衡性筛选优质方案
+    :param logic_blocks: 逻辑块信息
+    :param big_block_index: 超大块起始索引
+    :param block_number: 超大块分割份数
+    :param num_devices: 设备数量
+    :param top_k: 保留的优质方案数量
+    :return: 优质切割方案列表
+    """
+    num_blocks = len(logic_blocks)
+    candidate_schemes = []
+
+    # 超大块内部必须的切割点 (将超大块分为block_number份)
+    big_block_cuts = []
+    if block_number > 1:
+        # 在超大块内部生成block_number-1个切割点
+        big_block_cuts = list(np.linspace(
+            big_block_index + 1,
+            big_block_index + len(logic_blocks[big_block_index]['ops']) - 1,
+            block_number,
+            dtype=int
+        ))[:-1]  # 去掉最后一个点（已经是边界）
+
+    # 生成非超大块区域的候选切割点 (设备数量 - block_number - 1)
+    non_big_cut_count = num_devices - block_number - 1
+    candidate_positions = [
+        i for i in range(1, num_blocks)
+        if i < big_block_index or i >= big_block_index + len(logic_blocks[big_block_index]['ops'])
+    ]
+
+    # 随机生成切割方案
+    for _ in range(1000):  # 生成1000个候选方案
+        if non_big_cut_count > 0 and candidate_positions:
+            non_big_cuts = sorted(random.sample(candidate_positions, non_big_cut_count))
+        else:
+            non_big_cuts = []
+
+        full_cuts = sorted(non_big_cuts + big_block_cuts)
+        candidate_schemes.append(full_cuts)
+
+    # 计算每个切割方案的两个均衡分数
+    scored_schemes = []
+    for cuts in candidate_schemes:
+        compute_score, comm_score = evaluate_cut_scheme(logic_blocks, cuts, big_block_index, block_number)
+        # 使用调和平均作为综合分数
+        combined_score = 2 * compute_score * comm_score / (compute_score + comm_score + 1e-9)
+        scored_schemes.append((combined_score, cuts, compute_score, comm_score))
+
+    # 选择分数最高的top_k个方案
+    scored_schemes.sort(key=lambda x: x[0], reverse=True)
+    return [scheme[1] for scheme in scored_schemes[:top_k]]
+
+
+def evaluate_cut_scheme(logic_blocks, cut_points, big_block_index, block_number):
+    """
+    评估切割方案的两个均衡分数
+    :return: (计算量均衡分数, 通信量均衡分数)
+    """
+    segments = split_into_segments(logic_blocks, cut_points, big_block_index, block_number)
+
+    # 1. 计算量均衡分数 (各段计算量的标准差倒数)
+    compute_loads = [seg['total_flops'] for seg in segments]
+    compute_std = np.std(compute_loads)
+    compute_score = 1 / (compute_std + 1e-9)
+
+    # 2. 通信量均衡分数 (各切割点通信量的标准差倒数)
+    comm_loads = []
+    for i in range(len(segments) - 1):
+        comm_loads.append(segments[i]['output_size'])  # 段间通信量
+
+    comm_std = np.std(comm_loads)
+    comm_score = 1 / (comm_std + 1e-9)
+
+    return compute_score, comm_score
+
+
+def split_into_segments(logic_blocks, cut_points, big_block_index, block_number):
+    """
+    根据切割点划分逻辑块为多个段落
+    """
+    segments = []
+    start = 0
+    all_cuts = sorted(cut_points)
+
+    for cut in all_cuts:
+        segment_blocks = logic_blocks[start:cut]
+        segments.append(calculate_segment_stats(segment_blocks))
+        start = cut
+
+    # 添加最后一个段落
+    last_segment = logic_blocks[start:]
+    segments.append(calculate_segment_stats(last_segment))
+
+    # 处理超大块的特殊分割
+    for i, seg in enumerate(segments):
+        if big_block_index in [block['index'] for block in seg['blocks']]:
+            # 超大块需要分割为多个子段落
+            big_segments = split_big_block(seg, big_block_index, block_number)
+            segments = segments[:i] + big_segments + segments[i + 1:]
+            break
+
+    return segments
+
+
+def calculate_segment_stats(blocks):
+    """计算段落的统计信息"""
+    total_flops = sum(block['flops'] for block in blocks)
+    total_memory = max(block['memory'] for block in blocks)  # 峰值内存
+    output_size = blocks[-1]['output_size'] if blocks else 0
+
+    return {
+        'blocks': blocks,
+        'total_flops': total_flops,
+        'total_memory': total_memory,
+        'output_size': output_size
+    }
+
+
+def split_big_block(segment, big_block_index, block_number):
+    """分割超大块为多个子段落"""
+    big_block = None
+    other_blocks = []
+
+    # 分离超大块和其他块
+    for block in segment['blocks']:
+        if block['index'] == big_block_index:
+            big_block = block
+        else:
+            other_blocks.append(block)
+
+    if not big_block:
+        return [segment]
+
+    # 分割超大块内部的算子
+    ops = big_block['ops']
+    op_chunks = np.array_split(ops, block_number)
+
+    big_segments = []
+    for chunk in op_chunks:
+        # 创建子块
+        sub_block = {
+            'index': big_block_index,
+            'ops': chunk,
+            'flops': sum(op['flops'] for op in chunk),
+            'memory': max(op['memory'] for op in chunk),
+            'output_size': chunk[-1]['output_size'] if chunk else 0
+        }
+        # 每个子段落只包含超大块的一个子块
+        big_segments.append({
+            'blocks': [sub_block],
+            'total_flops': sub_block['flops'],
+            'total_memory': sub_block['memory'],
+            'output_size': sub_block['output_size']
+        })
+
+    return big_segments
+
+
+def optimize_device_assignment(segments, device_flops, mem_limits, bandwidth_matrix):
+    """
+    优化段落到设备的分配（考虑异构带宽）
+    :param segments: 段落列表（长度等于设备数）
+    :param device_flops: 设备计算能力 {device_id: FLOPS}
+    :param mem_limits: 设备内存限制 {device_id: bytes}
+    :param bandwidth_matrix: 设备间带宽矩阵 [i][j] = 从设备i到j的带宽 (bps)
+    :return: 帕累托最优解列表，每个解为(分配方案, 目标值)
+    """
+    num_devices = len(device_flops)
+    device_ids = list(device_flops.keys())
+
+    # NSGA-II 参数
+    POP_SIZE = 100
+    MAX_GEN = 200
+    CX_RATE = 0.85
+    MUT_RATE = 0.15
+
+    # 初始化种群 (分配方案)
+    population = []
+    for _ in range(POP_SIZE):
+        # 随机排列段落
+        perm = list(range(len(segments)))
+        random.shuffle(perm)
+        population.append(perm)
+
+    # 存储帕累托前沿
+    pareto_front = []
+
+    for gen in range(MAX_GEN):
+        # 评估种群
+        fitness = [evaluate_assignment(perm, segments, device_flops, mem_limits, bandwidth_matrix, device_ids)
+                   for perm in population]
+
+        # 非支配排序
+        fronts = non_dominated_sorting(fitness)
+
+        # 更新帕累托前沿 (保留第一前沿)
+        current_front = [population[i] for i in fronts[0]]
+        pareto_front = update_pareto_front(pareto_front, current_front, fitness, fronts[0])
+
+        # 选择父代 (基于前沿等级)
+        parents = []
+        for rank, front in enumerate(fronts):
+            if len(parents) + len(front) > POP_SIZE // 2:
+                # 按拥挤度选择部分
+                crowding = calculate_crowding([fitness[i] for i in front])
+                selected = select_by_crowding(front, crowding, POP_SIZE // 2 - len(parents))
+                parents.extend([population[i] for i in selected])
+                break
+            else:
+                parents.extend([population[i] for i in front])
+
+        # 生成子代
+        offspring = []
+        while len(offspring) < POP_SIZE - len(parents):
+            p1, p2 = random.sample(parents, 2)
+
+            # 交叉
+            if random.random() < CX_RATE:
+                c1, c2 = order_crossover(p1, p2)
+            else:
+                c1, c2 = p1[:], p2[:]
+
+            # 变异
+            if random.random() < MUT_RATE:
+                c1 = swap_mutation(c1)
+            if random.random() < MUT_RATE:
+                c2 = swap_mutation(c2)
+
+            offspring.append(c1)
+            if len(offspring) < POP_SIZE - len(parents):
+                offspring.append(c2)
+
+        # 新一代种群 = 父代 + 子代
+        population = parents + offspring
+
+    # 返回帕累托最优解（分配方案和对应的目标值）
+    return [(assign, evaluate_assignment(assign, segments, device_flops, mem_limits, bandwidth_matrix, device_ids))
+            for assign in pareto_front]
+
+
+def evaluate_assignment(assignment, segments, device_flops, mem_limits, bandwidth_matrix, device_ids):
+    """
+    评估分配方案的四个目标值
+    :return: (总延迟, 总通信量, 内存不均衡度, 计算负载不均衡度)
+    """
+    num_devices = len(device_ids)
+
+    # 1. 计算每个设备的计算时间
+    compute_times = []
+    memory_usages = []
+    for i, device_id in enumerate(device_ids):
+        seg_idx = assignment[i]
+        seg = segments[seg_idx]
+        compute_time = seg['total_flops'] / device_flops[device_id]
+        compute_times.append(compute_time)
+        memory_usages.append(seg['total_memory'] / mem_limits[device_id])
+
+    # 2. 计算通信时间
+    comm_times = []
+    comm_volumes = []
+    for i in range(num_devices - 1):
+        src_seg = segments[assignment[i]]
+        dst_seg = segments[assignment[i + 1]]
+
+        # 查找源设备和目标设备ID
+        src_device_idx = assignment.index(assignment[i])
+        dst_device_idx = assignment.index(assignment[i + 1])
+        src_device = device_ids[src_device_idx]
+        dst_device = device_ids[dst_device_idx]
+
+        # 获取设备间带宽
+        bandwidth = bandwidth_matrix[src_device][dst_device]
+        comm_volume = src_seg['output_size']
+        comm_time = comm_volume / bandwidth if bandwidth > 0 else float('inf')
+
+        comm_times.append(comm_time)
+        comm_volumes.append(comm_volume)
+
+    # 3. 计算总延迟 (关键路径)
+    # 使用动态规划计算流水线延迟
+    delays = [compute_times[0]]
+    for i in range(1, num_devices):
+        comm_delay = comm_times[i - 1] if i - 1 < len(comm_times) else 0
+        start_time = max(delays[i - 1], delays[i - 1] + comm_delay)
+        delays.append(start_time + compute_times[i])
+    total_delay = delays[-1]
+
+    # 4. 总通信量
+    total_comm = sum(comm_volumes)
+
+    # 5. 内存不均衡度 (标准差)
+    mem_imbalance = np.std(memory_usages)
+
+    # 6. 计算负载不均衡度 (标准差)
+    compute_imbalance = np.std(compute_times)
+
+    return (total_delay, total_comm, mem_imbalance, compute_imbalance)
+
+
+def non_dominated_sorting(fitness_values):
+    """快速非支配排序"""
+    num_solutions = len(fitness_values)
+    dominates = [[] for _ in range(num_solutions)]
+    dominated_by = [0] * num_solutions
+    fronts = [[]]
+
+    # 计算支配关系
+    for i in range(num_solutions):
+        for j in range(num_solutions):
+            if i == j:
+                continue
+            if dominates_solution(fitness_values[i], fitness_values[j]):
+                dominates[i].append(j)
+            elif dominates_solution(fitness_values[j], fitness_values[i]):
+                dominated_by[i] += 1
+
+        if dominated_by[i] == 0:
+            fronts[0].append(i)
+
+    # 分层其他前沿
+    current_front = 0
+    while fronts[current_front]:
+        next_front = []
+        for i in fronts[current_front]:
+            for j in dominates[i]:
+                dominated_by[j] -= 1
+                if dominated_by[j] == 0:
+                    next_front.append(j)
+
+        if next_front:
+            fronts.append(next_front)
+        current_front += 1
+
+    return fronts
+
+
+def dominates_solution(a, b):
+    """检查解a是否支配解b (所有目标最小化)"""
+    # a在所有目标上不劣于b，且至少一个目标严格更好
+    not_worse = all(a_i <= b_i for a_i, b_i in zip(a, b))
+    better = any(a_i < b_i for a_i, b_i in zip(a, b))
+    return not_worse and better
+
+
+def calculate_crowding(fitness_values):
+    """计算拥挤度距离"""
+    num_solutions = len(fitness_values)
+    if num_solutions == 0:
+        return []
+
+    num_objectives = len(fitness_values[0])
+    crowding = [0.0] * num_solutions
+
+    for obj_idx in range(num_objectives):
+        # 按当前目标值排序
+        sorted_indices = sorted(range(num_solutions), key=lambda i: fitness_values[i][obj_idx])
+
+        # 边界解有无限拥挤度
+        crowding[sorted_indices[0]] = float('inf')
+        crowding[sorted_indices[-1]] = float('inf')
+
+        if len(sorted_indices) <= 2:
+            continue
+
+        # 归一化目标值范围
+        min_val = fitness_values[sorted_indices[0]][obj_idx]
+        max_val = fitness_values[sorted_indices[-1]][obj_idx]
+        value_range = max_val - min_val
+        if value_range < 1e-9:
+            continue
+
+        # 计算内部解的拥挤度
+        for i in range(1, len(sorted_indices) - 1):
+            idx = sorted_indices[i]
+            next_val = fitness_values[sorted_indices[i + 1]][obj_idx]
+            prev_val = fitness_values[sorted_indices[i - 1]][obj_idx]
+            crowding[idx] += (next_val - prev_val) / value_range
+
+    return crowding
+
+
+def update_pareto_front(current_front, candidates, fitness_values, candidate_indices):
+    """更新帕累托前沿"""
+    new_front = current_front.copy()
+    candidate_fitness = [fitness_values[i] for i in candidate_indices]
+
+    # 添加非支配候选解
+    for i, cand in enumerate(candidates):
+        cand_fit = candidate_fitness[i]
+
+        # 检查是否被当前前沿支配
+        dominated = False
+        to_remove = []
+
+        for j, sol in enumerate(new_front):
+            sol_fit = evaluate_assignment(sol)  # 需要实际评估函数
+
+            if dominates_solution(sol_fit, cand_fit):
+                dominated = True
+                break
+            elif dominates_solution(cand_fit, sol_fit):
+                to_remove.append(j)
+
+        if not dominated:
+            # 移除被新解支配的旧解
+            for idx in sorted(to_remove, reverse=True):
+                new_front.pop(idx)
+            new_front.append(cand)
+
+    return new_front
+
+
+def order_crossover(p1, p2):
+    """顺序交叉 (OX)"""
+    size = len(p1)
+    a, b = sorted(random.sample(range(size), 2))
+
+    # 创建子代
+    c1 = [-1] * size
+    c2 = [-1] * size
+
+    # 复制中间段
+    c1[a:b] = p1[a:b]
+    c2[a:b] = p2[a:b]
+
+    # 填充剩余位置
+    fill_crossover(c1, p2, b, a)
+    fill_crossover(c2, p1, b, a)
+
+    return c1, c2
+
+
+def fill_crossover(child, parent, start, end):
+    """填充交叉后的剩余位置"""
+    size = len(child)
+    current = start
+    ptr = start
+
+    while -1 in child:
+        if ptr >= size:
+            ptr = 0
+
+        if parent[ptr] not in child:
+            child[current] = parent[ptr]
+            current = (current + 1) % size
+
+        ptr = (ptr + 1) % size
+
+        # 防止无限循环
+        if ptr == start:
+            break
+
+
+def swap_mutation(perm):
+    """交换变异"""
+    a, b = random.sample(range(len(perm)), 2)
+    perm[a], perm[b] = perm[b], perm[a]
+    return perm
+
+
+def find_global_optimum(cut_schemes, logic_blocks, device_flops, big_block_index,mem_limits, bandwidth_matrix):
+    """
+    全局优化：从优质切割方案中寻找最佳切割点+设备分配
+    :return: (最佳切割点, 最佳设备分配, 目标值)
+    """
+    all_pareto_solutions = []
+
+    # 对每个切割方案优化设备分配
+    for i, cuts in enumerate(cut_schemes):
+        print(f"优化切割方案 {i + 1}/{len(cut_schemes)}: 切割点 {cuts}")
+        segments = split_into_segments(logic_blocks, cuts, big_block_index, block_number)
+        pareto_solutions = optimize_device_assignment(
+            segments, device_flops, mem_limits, bandwidth_matrix
+        )
+
+        # 存储切割方案信息
+        for assign, objectives in pareto_solutions:
+            all_pareto_solutions.append({
+                'cut_scheme': cuts,
+                'assignment': assign,
+                'objectives': objectives
+            })
+
+    # 非支配排序所有解
+    fitness_values = [sol['objectives'] for sol in all_pareto_solutions]
+    fronts = non_dominated_sorting(fitness_values)
+
+    # 返回帕累托前沿的所有解
+    pareto_front = [all_pareto_solutions[i] for i in fronts[0]]
+    return pareto_front
+# def backbone_optimize(logic_blocks, big_block_index, block_number,df, device_flops, mem_limit, bandwidth_bps):
+#     # 设置2个固定切割点：
+#     # 1. 在超大块前（原index_front位置）
+#     fixed_cut1 = big_block_index
+#     # 2. 在超大块内部（分割两部分）
+#     fixed_cut2 = big_block_index + 1
+#     # 3. 在超大块后（原index_front+1位置）
+#     fixed_cuts = [fixed_cut1, fixed_cut2]
+#     block_info = preprocess_blocks(logic_blocks, df)
+#     num_blocks = len(block_info)
+#     num_devices = len(device_flops)
+#     num_backbone_method = 20    #一次生成20个优质方案
+#     # 计算切割点数量（如果是切割为4份子张量，寻找num_devices-6,如果切割为3份则num_devices-5，依次num_devices-4）
+#     num_cuts = num_devices - block_number - 2
+#     population = backbone_method_select(num_blocks, num_cuts, fixed_cuts,num_backbone_method)
+#
+#     return population, block_info, fixed_cuts
+#
+# def backbone_method_select(num_blocks,num_cuts,fixed_cuts,num_backbone_method):
+#     population = 1
+#     return population
+#
+
 # 主流程示例
 if __name__ == "__main__":
     # 初始化模型并进行 shape propagation
@@ -945,18 +1417,82 @@ if __name__ == "__main__":
         cases=cases,
         images_dir=images_dir,
         ground_truth_path=ground_truth_path,
-        batch_size=32
+        batch_size=32  # 更大的批处理大小
     )
 
     # 执行评估
     results = evaluator.evaluate()
-    # print(f'results:{results}')
-    # 找到最佳case和最佳切割方法
+
+
+    #
+    # accuracy_list = [75.68,74.90,74.91]
+    # for i in range(3):
+    #     cases[i]['accuracy']=accuracy_list[i]
+
     best_case = max(results, key=lambda x: x['best_accuracy'])
     print(f"最佳切割方案: {best_case['cut_layer']}--{best_case['paste_layer']}")
     print(f"最佳切割方法: {best_case['best_method']}")
-    print(f"最高准确率: {best_case['best_accuracy']:.4f}")
 
-    # 打印所有切割方法的准确率
-    for method, acc in best_case['accuracies'].items():
-        print(f"  {method}: {acc:.4f}")
+    #帕累托边界
+    index_front = 0
+    block_number = 0
+    for i in range(len(logical_layers)):
+        if logical_layers[i][0]==best_case['cut_layer']:
+            index_front = i
+    index_back = index_front+1
+    block_number = 0
+    if best_case['best_method'] in ['split_4_height','split_4_weight','split_4_grid']:
+        block_number = 4
+    elif best_case['best_method'] in ['split_3_height','split_3_weight']:
+        block_number = 3
+    else:
+        block_number = 2
+    # front_block = logical_layers[:index_front]
+    # back_block = logical_layers[index_back:]
+    num_devices = 7
+    device_flops = {
+        'rpi5_1': 320e9,
+        'rpi5_2': 320e9,
+        'rpi5_3': 320e9,
+        'jetson1': 472e9,
+        'jetson2': 472e9,
+        'jetson3': 472e9,
+        'pc_cpu': 500e9,
+    }
+    mem_limits = {
+        'rpi5_1': 16e9,
+        'rpi5_2': 16e9,
+        'rpi5_3': 16e9,
+        'jetson1': 32e9,
+        'jetson2': 32e9,
+        'jetson3': 32e9,
+        'pc_cpu': 64e9,
+    }
+
+    # 3. 带宽矩阵 (设备i到设备j的带宽)
+    bandwidth_matrix = {
+        'rpi5_1': {'rpi5_1': 0,'rpi5_2': 102.1, 'rpi5_3': 94.5, 'jetson1': 55.6, 'jetson2': 57.8,'jetson3': 55.5,'pc_cpu': 66.7},
+        'rpi5_2': {'rpi5_1': 102.1,'rpi5_2': 0, 'rpi5_3': 103.9, 'jetson1': 49.3, 'jetson2': 49.9,'jetson3': 59.9,'pc_cpu': 87.5},
+        'rpi5_3': {'rpi5_1': 94.5,'rpi5_2': 103.9, 'rpi5_3': 0, 'jetson1': 54.9, 'jetson2': 41.3, 'jetson3': 50.1, 'pc_cpu': 85.5},
+        'jetson1': {'rpi5_1': 55.6,'rpi5_2': 49.3, 'rpi5_3': 54.9, 'jetson1': 0, 'jetson2': 207.5, 'jetson3': 214.1, 'pc_cpu': 170.0},
+        'jetson2': {'rpi5_1': 57.8,'rpi5_2': 49.9, 'rpi5_3': 41.3, 'jetson1': 207.5, 'jetson2': 0, 'jetson3': 207.7, 'pc_cpu': 178.5},
+        'jetson3': {'rpi5_1': 55.5,'rpi5_2': 59.9, 'rpi5_3': 50.1, 'jetson1': 214.1, 'jetson2': 207.7, 'jetson3': 0, 'pc_cpu': 152.3},
+        'pc_cpu': {'rpi5_1': 66.7,'rpi5_2': 87.5, 'rpi5_3': 85.5, 'jetson1': 170.0, 'jetson2': 178.5, 'jetson3': 152.3, 'pc_cpu': 0},
+    }
+
+    # 第一阶段：生成并筛选优质切割方案
+    top_cut_schemes = generate_and_select_cut_schemes(
+        logical_layers, index_front, block_number, num_devices, top_k=50
+    )
+
+    # 第二阶段：全局优化
+    pareto_optimal = find_global_optimum(
+        top_cut_schemes, logical_layers, device_flops, mem_limits, bandwidth_matrix
+    )
+
+    print(f"找到 {len(pareto_optimal)} 个帕累托最优解")
+    for i, sol in enumerate(pareto_optimal):
+        print(f"方案 {i + 1}:")
+        print(f"  切割点: {sol['cut_scheme']}")
+        print(f"  设备分配: {sol['assignment']}")
+        print(f"  目标值 (延迟, 通信量, 内存不均衡, 计算不均衡): {sol['objectives']}")

@@ -1329,7 +1329,7 @@ if __name__ == "__main__":
     # end_time = time.time()
     # print(f'调用精度函数耗时{end_time - start_time}s')
 
-    images_dir = r"../11"
+    images_dir = r"../5h"
     ground_truth_path = r"ground_truth_label_5h.txt"
 
     # 创建评估器

@@ -19,6 +19,10 @@ from tqdm import tqdm
 import concurrent.futures
 import multiprocessing
 from functools import partial
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.cm as cm
+
 # --- 步骤 1.1：关键路径判断算法识别关键路径。 & 将不可分割节点合并为逻辑块 ---
 def find_critical_edges_dag(edges):
     in_degree = defaultdict(int)
@@ -179,7 +183,6 @@ def build_logic_blocks(fx_net):
 
     # --- 步骤 1.2：滑动窗口合并检测瓶颈块 ---
 
-
 def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
     """
         merged: 合并后的瓶颈段(节点索引范围)
@@ -313,10 +316,9 @@ def find_bottleneck_segments(df, blocks, window=3, thresh_ratio=1.3):
 
     return merged, merged_topk, logical_layers
 
-
+#   根据瓶颈段信息得到索引序号对应的层名
 def case_select(df, merged_topk):
 
-    #   根据瓶颈段信息生成切割点配置
     cases = []
     # 遍历每个瓶颈段
     for seg in merged_topk:
@@ -347,7 +349,7 @@ def case_select(df, merged_topk):
             })
 
     return cases
-
+#根据case的边重新划分模型，构建瓶颈块的前、后三部分
 def split_model(model, start_cut, end_cut):
     traced = symbolic_trace(model)
 
@@ -425,15 +427,12 @@ def split_model(model, start_cut, end_cut):
 
     return front_module, mid_module, tail_module
 
-
-def create_split_fn(model, start_layer, end_layer, num_splits=4):
+def create_split_fn_4_grid(model, start_layer, end_layer, num_splits=4):
     front, mid, tail = split_model(model, start_layer, end_layer)
 
     def forward_fn(x):
         # 前向传播
         front_out = front(x)
-
-        # print(f'前向传播后shape：{front_out.shape}')
 
         # 空间维度分割为4份
         _, _, h, w = front_out.shape
@@ -446,29 +445,170 @@ def create_split_fn(model, start_layer, end_layer, num_splits=4):
             front_out[:, :, h_chunk:, :w_chunk],
             front_out[:, :, h_chunk:, w_chunk:],
         ]
-
-        # for chunk in chunks:
-        #     print(f'mid前每个子张量shape：{chunk.shape}')
-
         # 并行处理中间部分
         mid_outs = [mid(chunk) for chunk in chunks]
-
-        # for mid_out in mid_outs:
-        #     print(f'mid后每个字张量shape{mid_out.shape}')
 
         # 重新拼接张量
         top = torch.cat([mid_outs[0], mid_outs[1]], dim=3)
         bottom = torch.cat([mid_outs[2], mid_outs[3]], dim=3)
         concat_out = torch.cat([top, bottom], dim=2)
 
-        # print(f'拼接后的shape：{concat_out.shape}')
-        # # 后向传播
-        # print(f'最后shape：{tail(concat_out).shape}')
+        return tail(concat_out)
+
+    return forward_fn
+def create_split_fn_4_weight(model, start_layer, end_layer, num_splits=4):
+    front, mid, tail = split_model(model, start_layer, end_layer)
+
+    front, mid, tail = split_model(model, start_layer, end_layer)
+
+    def forward_fn(x):
+        front_out = front(x)
+        _, _, h, w = front_out.shape
+        chunk_width = w // 4  # 计算每份宽度
+
+        # 沿宽度切割为4份
+        chunks = [
+            front_out[:, :, :, 0:chunk_width],
+            front_out[:, :, :, chunk_width:2 * chunk_width],
+            front_out[:, :, :, 2 * chunk_width:3 * chunk_width],
+            front_out[:, :, :, 3 * chunk_width:]
+        ]
+
+        # 并行处理中间层
+        mid_outs = [mid(chunk) for chunk in chunks]
+
+        # 沿宽度维度拼接结果
+        concat_out = torch.cat(mid_outs, dim=3)
+        return tail(concat_out)
+
+    return forward_fn
+
+
+def create_split_fn_4_height(model, start_layer, end_layer, num_splits=4):
+    front, mid, tail = split_model(model, start_layer, end_layer)
+
+    def forward_fn(x):
+        front_out = front(x)
+        _, _, h, w = front_out.shape
+        chunk_height = h // 4  # 计算每份高度
+
+        # 沿高度切割为4份
+        chunks = [
+            front_out[:, :, 0:chunk_height, :],
+            front_out[:, :, chunk_height:2 * chunk_height, :],
+            front_out[:, :, 2 * chunk_height:3 * chunk_height, :],
+            front_out[:, :, 3 * chunk_height:, :]
+        ]
+
+        # 并行处理中间层
+        mid_outs = [mid(chunk) for chunk in chunks]
+
+        # 沿高度维度拼接结果
+        concat_out = torch.cat(mid_outs, dim=2)
+        return tail(concat_out)
+
+    return forward_fn
+
+def create_split_fn_2_weight(model, start_layer, end_layer):
+    front, mid, tail = split_model(model, start_layer, end_layer)
+
+    def forward_fn(x):
+        # 前向传播
+        front_out = front(x)
+
+        # 沿宽度分割为两份
+        _, _, h, w = front_out.shape
+        w_split = w // 2  # 计算分割点
+
+        # 切割左右两部分
+        left_chunk = front_out[:, :, :, :w_split]
+        right_chunk = front_out[:, :, :, w_split:]
+
+        # 并行处理中间部分
+        mid_left = mid(left_chunk)
+        mid_right = mid(right_chunk)
+
+        # 沿宽度重新拼接
+        concat_out = torch.cat([mid_left, mid_right], dim=3)
 
         return tail(concat_out)
 
     return forward_fn
-# 定义 ImageDataset 类
+
+
+def create_split_fn_2_height(model, start_layer, end_layer):
+    front, mid, tail = split_model(model, start_layer, end_layer)
+
+    def forward_fn(x):
+        # 前向传播
+        front_out = front(x)
+
+        # 沿高度分割为两份
+        _, _, h, w = front_out.shape
+        h_split = h // 2  # 计算高度分割点
+
+        # 切割上下两部分
+        top_chunk = front_out[:, :, :h_split, :]
+        bottom_chunk = front_out[:, :, h_split:, :]
+
+        # 并行处理中间部分
+        mid_top = mid(top_chunk)
+        mid_bottom = mid(bottom_chunk)
+
+        # 沿高度重新拼接
+        concat_out = torch.cat([mid_top, mid_bottom], dim=2)
+
+        return tail(concat_out)
+
+    return forward_fn
+def create_split_fn_3_weight(model, start_layer, end_layer, num_splits=3):
+    front, mid, tail = split_model(model, start_layer, end_layer)
+
+    def forward_fn(x):
+        front_out = front(x)
+        _, _, h, w = front_out.shape
+        chunk_width = w // 3  # 计算每份宽度
+
+        # 沿宽度切割为4份
+        chunks = [
+            front_out[:, :, :, 0:chunk_width],
+            front_out[:, :, :, chunk_width:2 * chunk_width],
+            front_out[:, :, :, 2 * chunk_width:],
+        ]
+
+        # 并行处理中间层
+        mid_outs = [mid(chunk) for chunk in chunks]
+
+        # 沿宽度维度拼接结果
+        concat_out = torch.cat(mid_outs, dim=3)
+        return tail(concat_out)
+
+    return forward_fn
+
+def create_split_fn_3_height(model, start_layer, end_layer, num_splits=3):
+    front, mid, tail = split_model(model, start_layer, end_layer)
+    def forward_fn(x):
+        front_out = front(x)
+        _, _, h, w = front_out.shape
+        chunk_height = h // 3  # 计算每份高度
+
+        # 沿高度切割为4份
+        chunks = [
+            front_out[:, :, 0:chunk_height, :],
+            front_out[:, :, chunk_height:2 * chunk_height, :],
+            front_out[:, :, 2 * chunk_height:, :],
+        ]
+
+        # 并行处理中间层
+        mid_outs = [mid(chunk) for chunk in chunks]
+
+        # 沿高度维度拼接结果
+        concat_out = torch.cat(mid_outs, dim=2)
+        return tail(concat_out)
+
+    return forward_fn
+
+# 定义 ImageDataset 类加载测试数据集
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(self, image_files, images_dir, preprocess):
         self.image_files = image_files
@@ -484,7 +624,7 @@ class ImageDataset(torch.utils.data.Dataset):
         input_tensor = self.preprocess(img)
         return input_tensor, self.image_files[idx]
 
-
+#精度损失评估类
 class MultiModelEvaluator:
     def __init__(self, cases, images_dir, ground_truth_path, batch_size=64):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -497,16 +637,30 @@ class MultiModelEvaluator:
         self.base_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).to(self.device)
         self.base_model.eval()
 
+        # 定义十种种切割方法
+        self.split_methods = {
+            'split_2_height': create_split_fn_2_height,
+            'split_2_weight': create_split_fn_2_weight,
+            'split_3_height': create_split_fn_3_height,
+            'split_3_weight': create_split_fn_3_weight,
+            'split_4_height': create_split_fn_4_height,
+            'split_4_weight': create_split_fn_4_weight,
+            'split_4_grid': create_split_fn_4_grid
+        }
+
         # 创建所有切割模型
         self.models = {}
         for case in cases:
-            key = f"{case['cut_layer']}--{case['paste_layer']}"
-            model = self.create_cut_model(case)
-            self.models[key] = {
-                'model': model,
-                'case': case,
-                'predictions': []
-            }
+            case_key = f"{case['cut_layer']}--{case['paste_layer']}"
+            self.models[case_key] = {}
+
+            # 为每种切割方法创建模型
+            for method_name, split_fn in self.split_methods.items():
+                model = self.create_cut_model(case, split_fn)
+                self.models[case_key][method_name] = {
+                    'model': model,
+                    'predictions': []
+                }
 
         # 图像预处理
         self.preprocess = transforms.Compose([
@@ -530,8 +684,8 @@ class MultiModelEvaluator:
         # 加载真实标签
         self.ground_truth = self.load_ground_truth()
 
-    def create_cut_model(self, case):
-        """创建切割模型（不复制基础权重）"""
+    def create_cut_model(self, case, split_fn):
+        """创建切割模型（使用指定的切割函数）"""
         # 使用基础模型的权重引用，避免复制
         model = resnet50(weights=None).to(self.device)
 
@@ -540,9 +694,9 @@ class MultiModelEvaluator:
             param_dest.data = param_src.data
             param_dest.requires_grad = False
 
-        # 应用切割
-        split_fn = create_split_fn(model, case['cut_layer'], case['paste_layer'])
-        return split_fn
+        # 应用指定的切割函数
+        forward_fn = split_fn(model, case['cut_layer'], case['paste_layer'])
+        return forward_fn
 
     def load_ground_truth(self):
         """加载真实标签"""
@@ -557,7 +711,7 @@ class MultiModelEvaluator:
         return ground_truth
 
     def evaluate(self):
-        """执行评估"""
+        """执行评估（包含七种切割方式）"""
         start_time = time.time()
 
         # 使用大batch一次处理所有模型
@@ -565,45 +719,65 @@ class MultiModelEvaluator:
             for inputs, img_names in tqdm(self.dataloader, desc="处理批次"):
                 inputs = inputs.to(self.device, non_blocking=True)
 
-                # 对每个模型执行推理
-                for key, model_info in self.models.items():
-                    outputs = model_info['model'](inputs)
-                    probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                    predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
+                # 对每个切割方案执行推理
+                for case_key, methods in self.models.items():
+                    for method_name, method_info in methods.items():
+                        outputs = method_info['model'](inputs)
+                        probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                        predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
 
-                    # 存储预测结果
-                    for img_name, pred_class in zip(img_names, predicted_classes):
-                        img_base = os.path.splitext(img_name)[0]
-                        model_info['predictions'].append((img_base, str(pred_class)))
+                        # 存储预测结果
+                        for img_name, pred_class in zip(img_names, predicted_classes):
+                            img_base = os.path.splitext(img_name)[0]
+                            method_info['predictions'].append((img_base, str(pred_class)))
 
         # 计算准确率并保存结果
-        for key, model_info in self.models.items():
-            case = model_info['case']
-            predict_txt = f"test5h/CutPredict{case['cut_layer']} -- {case['paste_layer']}_5h.txt"
+        for case in self.cases:
+            case_key = f"{case['cut_layer']}--{case['paste_layer']}"
+            case_methods = self.models.get(case_key, {})
 
-            # 写入预测文件
-            with open(predict_txt, 'w') as f:
-                for img_base, pred_class in model_info['predictions']:
-                    f.write(f"{img_base}: {pred_class}\n")
+            # 初始化准确率字典
+            case['accuracies'] = {}
+            best_accuracy = 0
+            best_method = None
 
-            # 计算准确率
-            correct = 0
-            total = 0
-            for img_base, pred_class in model_info['predictions']:
-                true_class = self.ground_truth.get(img_base)
-                if true_class and true_class == pred_class:
-                    correct += 1
-                total += 1
+            for method_name, method_info in case_methods.items():
+                predict_txt = f"test5h/CutPredict{case['cut_layer']}--{case['paste_layer']}_{method_name}_5h.txt"
 
-            accuracy = correct / total if total > 0 else 0
-            case['accuracy'] = accuracy
-            print(f"切割方案 {key} 准确率: {accuracy:.4f} ({correct}/{total})")
+                # 写入预测文件
+                with open(predict_txt, 'w') as f:
+                    for img_base, pred_class in method_info['predictions']:
+                        f.write(f"{img_base}: {pred_class}\n")
+
+                # 计算准确率
+                correct = 0
+                total = 0
+                for img_base, pred_class in method_info['predictions']:
+                    true_class = self.ground_truth.get(img_base)
+                    if true_class and true_class == pred_class:
+                        correct += 1
+                    total += 1
+
+                accuracy = correct / total if total > 0 else 0
+                case['accuracies'][method_name] = accuracy
+
+                # 更新最佳方法
+                if accuracy > best_accuracy:
+                    best_accuracy = accuracy
+                    best_method = method_name
+
+                print(f"切割方案 {case_key} 方法 {method_name} 准确率: {accuracy:.4f} ({correct}/{total})")
+
+            # 记录最佳准确率和方法
+            case['best_accuracy'] = best_accuracy
+            case['best_method'] = best_method
+            print(f"切割方案 {case_key} 最佳方法: {best_method} 准确率: {best_accuracy:.4f}")
 
         elapsed = time.time() - start_time
-        print(f"评估完成! 总耗时: {elapsed:.2f}秒")
+        print(f"评估完成! 总耗时: {elapsed:.4f}秒")
         return self.cases
 
-
+#重计算每个块的峰值内存、flops等数据
 def preprocess_blocks(logic_blocks, df, input_size=0):
     """预处理逻辑块信息（支持分支结构）"""
     # 步骤1: 构建块级DAG
@@ -697,10 +871,9 @@ def preprocess_blocks(logic_blocks, df, input_size=0):
 
     return block_info
 
-# --- 步骤 1.4：NSGA-II 多目标优化寻找切割方案的帕累托前沿 ---
 
-
-def nsga2_optimize(logic_blocks, big_block_index, df, device_flops, mem_limit, bandwidth_bps,
+# --- 步骤 1.4：NSGA-II 多目标优化寻找切割方案的帕累托前沿 --
+def nsga2_optimize(logic_blocks, big_block_index, block_number,df, device_flops, mem_limit, bandwidth_bps,
                    pop_size=50, ngen=100, threshold=0.01, crossover_rate=0.8, mutation_rate=0.1):
     """
     使用 NSGA-II 算法优化模型划分方案
@@ -720,31 +893,13 @@ def nsga2_optimize(logic_blocks, big_block_index, df, device_flops, mem_limit, b
     # 1. 预处理逻辑块信息
     block_info = preprocess_blocks(logic_blocks, df)
     print(f'block_info:{block_info}')
-    split_ratio = 0.5  # 等分
-    big_block_part1 = {
-        'name': "bottleneck_part1",
-        'flops': block_info[big_block_index]['flops'] * split_ratio,
-        'total_memory': block_info[big_block_index]['total_memory'] * split_ratio,
-        'output_size': block_info[big_block_index]['output_size'] * split_ratio
-    }
-    big_block_part2 = {
-        'name': "bottleneck_part1",
-        'flops': block_info[big_block_index]['flops'] * (1 - split_ratio),
-        'total_memory': block_info[big_block_index]['total_memory'] * (1 - split_ratio),
-        'output_size': block_info[big_block_index]['output_size'] * (1 - split_ratio)
-    }
 
-    # # 创建新的逻辑块列表（包含拆分后的超大块）
-    new_logic_blocks = (
-            logic_blocks[:big_block_index] +
-            [big_block_part1, big_block_part2] +
-            logic_blocks[big_block_index + 1:]
-    )
+
     num_blocks = len(block_info)
     num_devices = len(device_flops)
 
-    # 计算切割点数量（设备数量减一）
-    num_cuts = num_devices - 4
+    # 计算切割点数量（如果是切割为4份子张量，寻找num_devices-6,如果切割为3份则num_devices-5，依次num_devices-4）
+    num_cuts = num_devices - block_number-2
 
     # 2. 初始化种群
     population = initialize_population(num_blocks, num_cuts, pop_size,fixed_cuts)
@@ -757,7 +912,7 @@ def nsga2_optimize(logic_blocks, big_block_index, df, device_flops, mem_limit, b
         fitness = []
         for ind in population:
             # try:
-            fit = evaluate_individual(ind, big_block_index,block_info, device_flops, mem_limit, bandwidth_bps)
+            fit = evaluate_individual(ind, big_block_index,block_number,block_info, device_flops, mem_limit, bandwidth_bps)
             fitness.append(fit)
             # except Exception as e:
             #     print(f"评估个体时出错11: {e}")
@@ -832,38 +987,37 @@ def nsga2_optimize(logic_blocks, big_block_index, df, device_flops, mem_limit, b
             # 检查种群中切割点是否重复
             duplicate_count = sum(1 for ind in population if len(set(ind)) != len(ind))
             print(
-                f"第 {gen} 代: 前沿大小 {len(fronts[0]) if fronts and fronts[0] else 0}, 最小延迟 {min_delay:.2f}, 重复个体数 {duplicate_count}")
+                f"第 {gen} 代: 前沿大小 {len(fronts[0]) if fronts and fronts[0] else 0}, 最小延迟 {min_delay:.8f}, 重复个体数 {duplicate_count}")
 
     # 4. 返回帕累托最优解和块信息
-    return population, block_info, fixed_cuts, new_logic_blocks
+    return population, block_info, fixed_cuts
+
+
 def initialize_population(num_blocks, num_cuts, pop_size, fixed_cuts):
-    """
-    初始化种群（避开固定切割点）
-    """
     population = []
     for _ in range(pop_size):
         if num_cuts == 0:
             individual = []
         else:
-            # 生成候选位置（排除固定切割点）
-            candidate_positions = [i for i in range(1, num_blocks) if i not in fixed_cuts]  # 修改点
-            # 确保切割点不重复且避开固定点
-            cut_points = sorted(random.sample(candidate_positions, num_cuts))  # 修改点
-            individual = cut_points
+            candidate_positions = [i for i in range(1, num_blocks) if i not in fixed_cuts]
 
+            # 关键修复：确保不请求超过可用位置的数量
+            actual_cuts = min(num_cuts, len(candidate_positions))
+            if actual_cuts > 0:
+                cut_points = sorted(random.sample(candidate_positions, actual_cuts))
+            else:
+                cut_points = []
+            individual = cut_points
         population.append(individual)
     return population
 
-def evaluate_individual2(ind, big_block_index, block_info, device_flops, mem_limit, bandwidth_bps):
-    """
-    评估个体的适应度
-    """
-    cut_points = ind.copy( )
+def evaluate_individual2(ind, big_block_index, block_number,block_info, device_flops, mem_limit, bandwidth_bps):
+    cut_points = ind.copy()
     num_blocks = len(block_info)
     num_devices = len(device_flops)
     device_list = list(device_flops.keys())
     cut_points.append(big_block_index)
-    cut_points.append(big_block_index+1)
+    cut_points.append(big_block_index + 1)
 
     all_cuts = sorted(list(set(cut_points)))  # 修改点：加入固定切割点
 
@@ -890,25 +1044,20 @@ def evaluate_individual2(ind, big_block_index, block_info, device_flops, mem_lim
         if not isinstance(seg, list) or not all(isinstance(i, int) for i in seg):
             return (float('inf'),) * 4
         if seg[0] == big_block_index:
-            total_flops = sum(block_info[i]['flops'] for i in seg)/2
-            total_memory = sum(block_info[i]['total_memory'] for i in seg)/2
+            total_flops = sum(block_info[i]['flops'] for i in seg) / block_number
+            total_memory = max(block_info[i]['total_memory'] for i in seg) / block_number
             if seg:  # 确保段落不为空
                 last_block_idx = seg[-1]
-                output_size = block_info[last_block_idx]['output_size']/2
+                output_size = block_info[last_block_idx]['output_size'] / block_number
             else:
                 output_size = 0
-            segment_stats.append({
-                'name':f'{seg[0]}_{seg[-1]}_1',
-                'flops': total_flops,
-                'memory': total_memory,
-                'output_size': output_size
-            })
-            segment_stats.append({
-                'name':f'{seg[0]}_{seg[-1]}_2',
-                'flops': total_flops,
-                'memory': total_memory,
-                'output_size': output_size
-            })
+            for i in range(1, block_number + 1):
+                segment_stats.append({
+                    'name': f'{seg[0]}_{seg[-1]}_{i}',
+                    'flops': total_flops,
+                    'memory': total_memory,
+                    'output_size': output_size
+                })
         else:
             total_flops = sum(block_info[i]['flops'] for i in seg)
             total_memory = sum(block_info[i]['total_memory'] for i in seg)
@@ -927,7 +1076,7 @@ def evaluate_individual2(ind, big_block_index, block_info, device_flops, mem_lim
                 'output_size': output_size
             })
     segment_stats_sorted = sorted(segment_stats, key=lambda x: x['flops'])
-    # 3. 将段落分配给设备（按顺序）
+
     device_stats = []
     for i, stats in enumerate(segment_stats_sorted):
         device = device_list[i]
@@ -968,11 +1117,12 @@ def evaluate_individual2(ind, big_block_index, block_info, device_flops, mem_lim
     # 目标2: 总通信量 (字节)
     total_comm = sum(device_stats[i]['output_size'] for i in range(len(device_stats) - 1))
 
-    # 目标3: 内存超限量 (字节)
-    mem_over = 0
+    # 目标3: 内存占用率标准差
+    memory_ratio_total = []
     for stats in device_stats:
-        if stats['memory'] > mem_limit:
-            mem_over += (stats['memory'] - mem_limit)
+        memory_ratio = stats['memory'] / mem_limit
+        memory_ratio_total.append(memory_ratio)
+    mem_over = np.std(memory_ratio_total)
     # print(f'device_stats:{device_stats}')
     # 目标4: 负载均衡 (计算时间方差)
     compute_times = [stats['compute_time'] for stats in device_stats]
@@ -984,72 +1134,118 @@ def evaluate_individual2(ind, big_block_index, block_info, device_flops, mem_lim
     return (total_delay, total_comm, mem_over, compute_var,device_stats)
 
 
+import numpy as np
+import networkx as nx
 
-def evaluate_individual(ind, big_block_index, block_info, device_flops, mem_limit, bandwidth_bps):
+
+def evaluate_individual(ind, big_block_index, block_number, block_info, device_flops, mem_limit,bandwidth_bps):
     """
-    评估个体的适应度
+    评估个体的适应度（考虑异构设备负载和带宽）
+
+    参数新增：
+    device_load_dict: 设备名->当前负载(0-1)
+    device_bandwidth_dict: (from_device, to_device)->带宽(Mbps)
     """
-    cut_points = ind.copy( )
+
+    device_load_dict = {
+        'rpi5_1': 0.182,
+        'rpi5_2': 0.235,
+        'rpi5_3': 0.203,
+        'jetson1': 0.217,
+        'jetson2': 0.246,
+        'jetson3': 0.3,
+        'pc_cpu': 0.483,
+    }
+    device_bandwidth_dict = {
+        ('rpi5_1', 'rpi5_2'): 102.1,
+        ('rpi5_1', 'rpi5_3'): 94.5,
+        ('rpi5_1', 'jetson1'): 55.6,
+        ('rpi5_1', 'jetson2'): 57.8,
+        ('rpi5_1', 'jetson3'): 55.5,
+        ('rpi5_1', 'pc_cpu'): 66.7,
+        ('rpi5_2', 'rpi5_1'): 102.1,
+        ('rpi5_2', 'rpi5_3'): 103.9,
+        ('rpi5_2', 'jetson1'): 49.3,
+        ('rpi5_2', 'jetson2'): 49.9,
+        ('rpi5_2', 'jetson3'): 59.9,
+        ('rpi5_2', 'pc_cpu'): 87.5,
+        ('rpi5_3', 'rpi5_1'): 94.5,
+        ('rpi5_3', 'rpi5_2'): 103.9,
+        ('rpi5_3', 'jetson1'): 54.9,
+        ('rpi5_3', 'jetson2'): 41.3,
+        ('rpi5_3', 'jetson3'): 50.1,
+        ('rpi5_3', 'pc_cpu'): 85.5,
+        ('jetson1', 'rpi5_1'): 55.6,
+        ('jetson1', 'rpi5_2'): 49.3,
+        ('jetson1', 'rpi5_3'): 54.9,
+        ('jetson1', 'jetson2'): 207.5,
+        ('jetson1', 'jetson3'): 214.1,
+        ('jetson1', 'pc_cpu'): 170.0,
+        ('jetson2', 'rpi5_1'): 57.8,
+        ('jetson2', 'rpi5_2'): 49.9,
+        ('jetson2', 'rpi5_3'): 41.3,
+        ('jetson2', 'jetson1'): 207.5,
+        ('jetson2', 'jetson3'): 207.7,
+        ('jetson2', 'pc_cpu'): 178.5,
+        ('jetson3', 'rpi5_1'): 55.5,
+        ('jetson3', 'rpi5_2'): 59.9,
+        ('jetson3', 'rpi5_3'): 50.1,
+        ('jetson3', 'jetson1'): 214.1,
+        ('jetson3', 'jetson2'): 207.7,
+        ('jetson3', 'pc_cpu'): 152.3,
+        ('pc_cpu', 'rpi5_1'): 66.7,
+        ('pc_cpu', 'rpi5_2'): 87.5,
+        ('pc_cpu', 'rpi5_3'): 85.5,
+        ('pc_cpu', 'jetson1'): 170.0,
+        ('pc_cpu', 'jetson2'): 178.5,
+        ('pc_cpu', 'jetson3'): 152.3
+    }
+    # 1. 处理切割点
+    cut_points = ind.copy()
     num_blocks = len(block_info)
     num_devices = len(device_flops)
     device_list = list(device_flops.keys())
     cut_points.append(big_block_index)
-    cut_points.append(big_block_index+1)
+    cut_points.append(big_block_index + 1)
+    all_cuts = sorted(list(set(cut_points)))
 
-    all_cuts = sorted(list(set(cut_points)))  # 修改点：加入固定切割点
-
-    # print(f'all_cuts:{all_cuts}')
-    # 1. 根据切割点划分段落
+    # 2. 划分段落
     segments = []
     start = 0
     for cut in all_cuts:
         segments.append(list(range(start, cut)))
         start = cut
     segments.append(list(range(start, num_blocks)))
-    # print(f'segments:{segments}')
-    #
-    # num_segments = len(segments)
-    #
-    # # 段落数量应该等于设备数量
-    # if num_segments != num_devices:
-    #     return (float('inf'), float('inf'), float('inf'), float('inf'))
 
-    # 2. 计算每个段落的资源需求
+    # 检查段落数是否等于设备数
+    if len(segments) != num_devices:
+        return (float('inf'),) * 4
+
+    # 3. 计算段落资源需求
     segment_stats = []
     for seg in segments:
-        # 确保 seg 是整数索引列表
-        if not isinstance(seg, list) or not all(isinstance(i, int) for i in seg):
-            return (float('inf'),) * 4
-        if seg[0] == big_block_index:
-            total_flops = sum(block_info[i]['flops'] for i in seg)/2
-            total_memory = sum(block_info[i]['total_memory'] for i in seg)/2
-            if seg:  # 确保段落不为空
-                last_block_idx = seg[-1]
-                output_size = block_info[last_block_idx]['output_size']/2
-            else:
-                output_size = 0
-            segment_stats.append({
-                'name':f'{seg[0]}_{seg[-1]}_1',
-                'flops': total_flops,
-                'memory': total_memory,
-                'output_size': output_size
-            })
-            segment_stats.append({
-                'name':f'{seg[0]}_{seg[-1]}_2',
-                'flops': total_flops,
-                'memory': total_memory,
-                'output_size': output_size
-            })
+        if seg and seg[0] == big_block_index:  # 特殊处理大块
+            total_flops = sum(block_info[i]['flops'] for i in seg) / block_number
+            total_memory = max(block_info[i]['total_memory'] for i in seg) / block_number
+            last_block_idx = seg[-1]
+            output_size = block_info[last_block_idx]['output_size'] / block_number
+
+            # 拆分为block_number个相同子段落
+            for i in range(1, block_number + 1):
+                segment_stats.append({
+                    'name': f'{seg[0]}_{seg[-1]}_{i}',
+                    'flops': total_flops,
+                    'memory': total_memory,
+                    'output_size': output_size
+                })
         else:
+            if not seg:  # 空段落处理
+                return (float('inf'),) * 4
+
             total_flops = sum(block_info[i]['flops'] for i in seg)
             total_memory = sum(block_info[i]['total_memory'] for i in seg)
-
-            # 获取最后一块的输出大小
-            if seg:  # 确保段落不为空
-                last_block_idx = seg[-1]
-                output_size = block_info[last_block_idx]['output_size']
-            else:
-                output_size = 0
+            last_block_idx = seg[-1]
+            output_size = block_info[last_block_idx]['output_size']
 
             segment_stats.append({
                 'name': f'{seg[0]}_{seg[-1]}',
@@ -1057,53 +1253,127 @@ def evaluate_individual(ind, big_block_index, block_info, device_flops, mem_limi
                 'memory': total_memory,
                 'output_size': output_size
             })
-    segment_stats_sorted = sorted(segment_stats, key=lambda x: x['flops'])
-    # 3. 将段落分配给设备（按顺序）
-    device_stats = []
-    for i, stats in enumerate(segment_stats_sorted):
-        device = device_list[i]
-        flops = device_flops[device]
-        compute_time = stats['flops'] / flops if flops > 0 else float('inf')
-        device_stats.append({
-            'compute_time': compute_time,
-            'memory': stats['memory'],
-            'output_size': stats['output_size'],
-            'device': device
-        })
 
-    # 4. 计算目标函数
-    # 目标1: 总延迟 (关键路径时间)
-    if not device_stats:
+    # 4. 构建最小费用流图
+    G = nx.DiGraph()
+
+    # 添加源点(source)和汇点(sink)
+    source = "source"
+    sink = "sink"
+    G.add_node(source)
+    G.add_node(sink)
+
+    # 添加段落节点和设备节点
+    segment_nodes = [f"seg_{i}" for i in range(len(segment_stats))]
+    device_nodes = list(device_flops.keys())
+
+    # 添加节点
+    for node in segment_nodes + device_nodes:
+        G.add_node(node)
+
+    # 添加边：源点到段落
+    for i, seg_node in enumerate(segment_nodes):
+        # 容量为1，费用为0
+        G.add_edge(source, seg_node, capacity=1, weight=0)
+
+    # 添加边：段落到设备
+    for i, seg_node in enumerate(segment_nodes):
+        seg = segment_stats[i]
+        for j, dev in enumerate(device_nodes):
+            # 计算考虑负载后的执行时间
+            effective_flops = device_flops[dev] * (1 - device_load_dict[dev])
+            if effective_flops <= 0:
+                compute_time = float('inf')
+            else:
+                compute_time = seg['flops'] / effective_flops
+
+            # 添加边（容量1，费用为计算时间）
+            G.add_edge(seg_node, dev, capacity=1, weight=compute_time)
+
+    # 添加边：设备到汇点
+    for dev in device_nodes:
+        # 容量为1，费用为0
+        G.add_edge(dev, sink, capacity=1, weight=0)
+
+    # 5. 计算最小费用流
+    try:
+        min_cost_flow = nx.max_flow_min_cost(G, source, sink)
+        flow_cost = nx.cost_of_flow(G, min_cost_flow)
+    except nx.NetworkXUnfeasible:
         return (float('inf'),) * 4
 
+    # 6. 提取匹配结果
+    device_assignment = {}
+    for seg_node in segment_nodes:
+        for dev, flow in min_cost_flow[seg_node].items():
+            if flow > 0 and dev in device_nodes:
+                seg_index = int(seg_node.split("_")[1])
+                device_assignment[seg_index] = dev
+                break
+
+    # 7. 按原始顺序构建device_stats
+    device_stats = []
+    for i in range(len(segment_stats)):
+        dev = device_assignment.get(i)
+        if dev is None:
+            return (float('inf'),) * 4
+
+        seg = segment_stats[i]
+        effective_flops = device_flops[dev] * (1 - device_load_dict[dev])
+        compute_time = seg['flops'] / effective_flops if effective_flops > 0 else float('inf')
+
+        device_stats.append({
+            'compute_time': compute_time,
+            'memory': seg['memory'],
+            'output_size': seg['output_size'],
+            'device': dev
+        })
+
+    # 8. 计算目标函数
+    # 目标1: 总延迟（关键路径时间）
     delays = [device_stats[0]['compute_time']]
     comm_times = []
 
-    # 计算通信时间
+    # 计算通信时间（考虑实际带宽）
     for i in range(len(device_stats) - 1):
+        from_dev = device_stats[i]['device']
+        to_dev = device_stats[i + 1]['device']
         comm_size = device_stats[i]['output_size']
-        comm_time = comm_size / bandwidth_bps
+
+        # 获取实际带宽（转换为字节/秒）
+        bw_mbps = device_bandwidth_dict.get((from_dev, to_dev), 0)
+        bw_bps = (bw_mbps * 1e6) / 8  # 转换为字节/秒
+
+        if bw_bps > 0:
+            comm_time = comm_size / bw_bps
+        else:
+            comm_time = float('inf')
         comm_times.append(comm_time)
 
     # 计算流水线延迟
     for i in range(1, len(device_stats)):
-        prev_delay = delays[i - 1]
         comm_delay = comm_times[i - 1] if i - 1 < len(comm_times) else 0
-        start_time = max(prev_delay, prev_delay + comm_delay)
+        start_time = delays[i - 1] + comm_delay
         delays.append(start_time + device_stats[i]['compute_time'])
 
     total_delay = delays[-1] if delays else 0
 
-    # 目标2: 总通信量 (字节)
-    total_comm = sum(device_stats[i]['output_size'] for i in range(len(device_stats) - 1))
+    # 目标2: 总通信量（字节）
+    total_comm = 0
+    for i in range(len(device_stats) - 1):
+        from_dev = device_stats[i]['device']
+        to_dev = device_stats[i + 1]['device']
+        if from_dev != to_dev:  # 仅计算跨设备通信
+            total_comm += device_stats[i]['output_size']
 
-    # 目标3: 内存超限量 (字节)
-    mem_over = 0
+    # 目标3: 内存占用率标准差
+    memory_ratios = []
     for stats in device_stats:
-        if stats['memory'] > mem_limit:
-            mem_over += (stats['memory'] - mem_limit)
-    # print(f'device_stats:{device_stats}')
-    # 目标4: 负载均衡 (计算时间方差)
+        memory_ratio = stats['memory'] / mem_limit
+        memory_ratios.append(memory_ratio)
+    mem_over = np.std(memory_ratios)
+
+    # 目标4: 负载均衡（计算时间方差）
     compute_times = [stats['compute_time'] for stats in device_stats]
     if len(compute_times) > 1:
         compute_var = np.std(compute_times)
@@ -1111,14 +1381,10 @@ def evaluate_individual(ind, big_block_index, block_info, device_flops, mem_limi
         compute_var = 0
 
     return (total_delay, total_comm, mem_over, compute_var)
-
-    # except Exception as e:
-    #     print(f"评估个体时出错22: {e}")
-    #     return (float('inf'), float('inf'), float('inf'), float('inf'))
 def crossover(p1, p2, num_blocks, num_cuts,fixed_cuts):
     """交叉操作 - 确保切割点不重复"""
-    if num_cuts == 0:
-        return [], []
+    if num_cuts <= 1:
+        return p1[:], p2[:]
 
     # 确保切割点排序
     p1 = sorted(p1)
@@ -1369,6 +1635,146 @@ def check_convergence(current_front, prev_front, threshold):
     return avg_change < threshold
 
 
+def plot_pareto_front(pareto_solutions, block_info,big_block_index, device_flops, mem_limit, bandwidth_bps):
+    """
+    Plot Pareto front with 3D scatter plot and parallel coordinates plot
+    """
+    if not pareto_solutions:
+        print("No Pareto solutions found")
+        return
+
+    # Re-evaluate all Pareto solutions
+    fitness_values = []
+    all_device_stats = []
+
+    for solution in pareto_solutions:
+        result = evaluate_individual2(
+            solution,
+            big_block_index,
+            block_number,
+            block_info,
+            device_flops,
+            mem_limit,
+            bandwidth_bps
+        )
+
+        if result[0] < float('inf'):
+            fitness_values.append(result[:4])  # First four objectives
+            all_device_stats.append(result[4])  # Device statistics
+
+    if not fitness_values:
+        print("All Pareto solutions are invalid")
+        return
+
+    # Convert to numpy array
+    fitness_array = np.array(fitness_values)
+    objectives = ['Total Delay', 'Total Communication', 'Memory Std Dev', 'Compute Time Std Dev']
+
+    # Create figure
+    fig = plt.figure(figsize=(18, 12))
+
+    # 3D Scatter Plot
+    ax1 = fig.add_subplot(231, projection='3d')
+    sc = ax1.scatter(
+        fitness_array[:, 0],
+        fitness_array[:, 1],
+        fitness_array[:, 2],
+        c=fitness_array[:, 3],
+        cmap='viridis',
+        s=50
+    )
+    ax1.set_xlabel(objectives[0])
+    ax1.set_ylabel(objectives[1])
+    ax1.set_zlabel(objectives[2])
+    ax1.set_title('Pareto Front (3D View)')
+    fig.colorbar(sc, ax=ax1, label=objectives[3])
+
+    # 2D Projections
+    ax2 = fig.add_subplot(232)
+    ax2.scatter(fitness_array[:, 0], fitness_array[:, 1], c=fitness_array[:, 3], cmap='viridis')
+    ax2.set_xlabel(objectives[0])
+    ax2.set_ylabel(objectives[1])
+    ax2.set_title(f'{objectives[0]} vs {objectives[1]}')
+
+    ax3 = fig.add_subplot(233)
+    ax3.scatter(fitness_array[:, 0], fitness_array[:, 2], c=fitness_array[:, 3], cmap='viridis')
+    ax3.set_xlabel(objectives[0])
+    ax3.set_ylabel(objectives[2])
+    ax3.set_title(f'{objectives[0]} vs {objectives[2]}')
+
+    ax4 = fig.add_subplot(234)
+    ax4.scatter(fitness_array[:, 1], fitness_array[:, 2], c=fitness_array[:, 3], cmap='viridis')
+    ax4.set_xlabel(objectives[1])
+    ax4.set_ylabel(objectives[2])
+    ax4.set_title(f'{objectives[1]} vs {objectives[2]}')
+
+    # Parallel Coordinates Plot
+    ax5 = fig.add_subplot(235)
+    # Avoid division by zero
+    ranges = fitness_array.max(axis=0) - fitness_array.min(axis=0)
+    ranges[ranges == 0] = 1  # Prevent division by zero
+    normalized = (fitness_array - fitness_array.min(axis=0)) / ranges
+
+    for i in range(normalized.shape[0]):
+        ax5.plot(normalized[i], 'o-', alpha=0.5, linewidth=1)
+
+    ax5.set_xticks(range(len(objectives)))
+    ax5.set_xticklabels(objectives, rotation=45)
+    ax5.set_title('Parallel Coordinates Plot')
+    ax5.set_ylabel('Normalized Value')
+    ax5.grid(True, linestyle='--', alpha=0.6)
+
+    # Device Load Distribution
+    ax6 = fig.add_subplot(236)
+
+    if all_device_stats:
+        # Select the best solution (minimal total delay)
+        best_idx = np.argmin(fitness_array[:, 0])
+        device_stats = all_device_stats[best_idx]
+
+        devices = [stat['device'] for stat in device_stats]
+        compute_times = [stat['compute_time'] for stat in device_stats]
+        memory_usage = [stat['memory'] for stat in device_stats]
+
+        width = 0.35
+        x = np.arange(len(devices))
+
+        ax6.bar(x - width / 2, compute_times, width, label='Compute Time (s)')
+        ax6.bar(x + width / 2, memory_usage, width, label='Memory Usage (MB)')
+
+        ax6.set_xlabel('Devices')
+        ax6.set_ylabel('Resource Usage')
+        ax6.set_title('Device Resource Usage (Best Solution)')
+        ax6.set_xticks(x)
+        ax6.set_xticklabels(devices)
+        ax6.legend()
+        ax6.grid(True, axis='y', linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig('pareto/pareto_front.png', dpi=300, bbox_inches='tight')
+
+    # Print best solution details
+    best_solution = pareto_solutions[best_idx]
+    best_fitness = fitness_array[best_idx]
+
+    print("\n" + "=" * 80)
+    print("Best Solution Details (Minimal Total Delay):")
+    print(f"Cut Points: {best_solution}")
+    print(f"Fixed Cut Points: {fixed_cuts}")
+    print(f"Total Delay: {best_fitness[0]:.6f} seconds")
+    print(f"Total Communication: {best_fitness[1] / 1e6:.2f} MB")
+    print(f"Memory Std Deviation: {best_fitness[2]:.4f}")
+    print(f"Compute Time Std Deviation: {best_fitness[3]:.6f}")
+
+    print("\nDevice Assignment Details:")
+    for stat in device_stats:
+        print(f"Device {stat['device']}: "
+              f"Compute Time = {stat['compute_time']:.6f}s, "
+              f"Memory Usage = {stat['memory'] / 1e6:.2f} MB, "
+              f"Output Size = {stat['output_size'] / 1e6:.2f} MB")
+
+    print("=" * 80)
+
 # 主流程示例
 if __name__ == "__main__":
     # 初始化模型并进行 shape propagation
@@ -1380,7 +1786,6 @@ if __name__ == "__main__":
     blocks = build_logic_blocks(fx)
     print("关键边后的逻辑块blocks:", blocks)
     df = profile_and_tabulate(model)
-    print(df)
     # 1.2 滑动窗口合并
     merged,merged_topk,logical_layers = find_bottleneck_segments(df, blocks,window=2,thresh_ratio=1.8)
     print("合并后的瓶颈块merged:", merged)
@@ -1390,12 +1795,7 @@ if __name__ == "__main__":
     cases = case_select(df, merged_topk)
     print(f'验证的瓶颈层案例cases：{cases}')
 
-    # start_time = time.time()
-    # cases = evaluate_precision_decay(cases)
-    # print(f'预测精度后的cases{cases}')
-    # # # print(f'预测精度后的cases{evaluate_precision_decay(cases)}')
-    # end_time = time.time()
-    # print(f'调用精度函数耗时{end_time - start_time}s')
+
 
     images_dir = r"../5h"
     ground_truth_path = r"ground_truth_label_5h.txt"
@@ -1410,24 +1810,31 @@ if __name__ == "__main__":
 
     # 执行评估
     results = evaluator.evaluate()
-
+    print(results)
 
     #
     # accuracy_list = [75.68,74.90,74.91]
     # for i in range(3):
     #     cases[i]['accuracy']=accuracy_list[i]
 
-    max_case = max(cases, key=lambda x: x['accuracy'])
-    print(max_case)
+    best_case = max(results, key=lambda x: x['best_accuracy'])
+    print(f"最佳切割方案: {best_case['cut_layer']}--{best_case['paste_layer']}")
+    print(f"最佳切割方法: {best_case['best_method']}")
 
     #帕累托边界
     index_front = 0
-
+    block_number = 0
     for i in range(len(logical_layers)):
-        if logical_layers[i][0]==max_case['cut_layer']:
+        if logical_layers[i][0]==best_case['cut_layer']:
             index_front = i
     index_back = index_front+1
-
+    block_number = 0
+    if best_case['best_method'] in ['split_4_height','split_4_weight','split_4_grid']:
+        block_number = 4
+    elif best_case['best_method'] in ['split_3_height','split_3_weight']:
+        block_number = 3
+    else:
+        block_number = 2
     # front_block = logical_layers[:index_front]
     # back_block = logical_layers[index_back:]
     device_flops = {
@@ -1442,10 +1849,14 @@ if __name__ == "__main__":
     mem_limit = 4 * 1024 ** 2  # 4GB
     bandwidth_bps = 4e6  # 1MB/s
 
+    start_time = time.time()
+
+
     # 5. 运行优化
-    pareto_solutions, block_info, fixed_cuts, new_logic_blocks = nsga2_optimize(
+    pareto_solutions, block_info, fixed_cuts = nsga2_optimize(
         logic_blocks=logical_layers,
         big_block_index=index_front,
+        block_number=block_number,
         df=df,
         device_flops=device_flops,
         mem_limit=mem_limit,
@@ -1453,29 +1864,114 @@ if __name__ == "__main__":
         pop_size=50,
         ngen=50
     )
+    end_time = time.time()
+    plot_pareto_front(pareto_solutions, block_info, index_front,device_flops, mem_limit, bandwidth_bps)
+
+    print(f'帕累托求解耗时{end_time - start_time}s')
     # print(pareto_solutions)
     if pareto_solutions:
         print(f"找到 {len(pareto_solutions)} 个帕累托最优解")
 
         # 按总延迟排序
         pareto_solutions.sort(
-            key=lambda ind: evaluate_individual(ind, index_front, block_info, device_flops, mem_limit, bandwidth_bps)[0]
+            key=lambda ind: evaluate_individual2(ind, index_front,block_number, block_info, device_flops, mem_limit, bandwidth_bps)[0]
         )
 
         # 输出前3个最优解
-        for i, solution in enumerate(pareto_solutions[:3]):
+        for i, solution in enumerate(pareto_solutions[:2]):
             # 合并所有切割点
 
             delay, comm, mem_over, balance,device_stats = evaluate_individual2(
-                solution, index_front, block_info, device_flops, mem_limit, bandwidth_bps
+                solution, index_front, block_number, block_info, device_flops, mem_limit, bandwidth_bps
             )
             solution.append(index_front)
             solution.append(index_front+1)
 
             print(f"\n方案 {i + 1}:")
-            print(f"总延迟: {delay:.4f}秒")
+            print(f"总延迟: {delay:.8f}秒")
             print(f"总通信量: {comm / 1e6:.2f}MB")
-            print(f"内存超限: {mem_over / 1e6:.2f}MB")
+            print(f"内存占用标准差: {mem_over:.2f}")
+            print(f"负载均衡方差: {balance:.4f}")
+
+            # 显示所有切割点
+            print(f"所有切割点位置: {sorted(solution)}")
+            print(f"固定切割点位置: {fixed_cuts}")
+            for sta in device_stats:
+                print(f"{logical_layers[int(sta['name'].split('_')[0]):int(sta['name'].split('_')[1])+1]}被分配在{sta['device']}上")
+            print(f'切割段落数据：{device_stats}')
+
+        pareto_solutions.sort(
+            key=lambda ind: evaluate_individual2(ind, index_front,block_number, block_info, device_flops, mem_limit, bandwidth_bps)[1]
+        )
+
+        # 输出前3个最优解
+        for i, solution in enumerate(pareto_solutions[:2]):
+            # 合并所有切割点
+
+            delay, comm, mem_over, balance,device_stats = evaluate_individual2(
+                solution, index_front, block_number, block_info, device_flops, mem_limit, bandwidth_bps
+            )
+            solution.append(index_front)
+            solution.append(index_front+1)
+
+            print(f"\n方案 {i + 1}:")
+            print(f"总延迟: {delay:.8f}秒")
+            print(f"总通信量: {comm / 1e6:.2f}MB")
+            print(f"内存占用标准差: {mem_over:.2f}")
+            print(f"负载均衡方差: {balance:.4f}")
+
+            # 显示所有切割点
+            print(f"所有切割点位置: {sorted(solution)}")
+            print(f"固定切割点位置: {fixed_cuts}")
+            for sta in device_stats:
+                print(f"{logical_layers[int(sta['name'].split('_')[0]):int(sta['name'].split('_')[1])+1]}被分配在{sta['device']}上")
+            print(f'切割段落数据：{device_stats}')
+
+        pareto_solutions.sort(
+            key=lambda ind: evaluate_individual2(ind, index_front,block_number, block_info, device_flops, mem_limit, bandwidth_bps)[2]
+        )
+
+        # 输出前3个最优解
+        for i, solution in enumerate(pareto_solutions[:2]):
+            # 合并所有切割点
+
+            delay, comm, mem_over, balance,device_stats = evaluate_individual2(
+                solution, index_front, block_number, block_info, device_flops, mem_limit, bandwidth_bps
+            )
+            solution.append(index_front)
+            solution.append(index_front+1)
+
+            print(f"\n方案 {i + 1}:")
+            print(f"总延迟: {delay:.8f}秒")
+            print(f"总通信量: {comm / 1e6:.2f}MB")
+            print(f"内存占用标准差: {mem_over:.2f} ")
+            print(f"负载均衡方差: {balance:.4f}")
+
+            # 显示所有切割点
+            print(f"所有切割点位置: {sorted(solution)}")
+            print(f"固定切割点位置: {fixed_cuts}")
+            for sta in device_stats:
+                print(f"{logical_layers[int(sta['name'].split('_')[0]):int(sta['name'].split('_')[1])+1]}被分配在{sta['device']}上")
+            print(f'切割段落数据：{device_stats}')
+
+        pareto_solutions.sort(
+            key=lambda ind: evaluate_individual2(ind, index_front,block_number, block_info, device_flops, mem_limit, bandwidth_bps)[3]
+        )
+
+        # 输出前3个最优解
+        for i, solution in enumerate(pareto_solutions[:1]):
+            # 合并所有切割点
+
+            delay, comm, mem_over, balance,device_stats = evaluate_individual2(
+                solution, index_front, block_number, block_info, device_flops, mem_limit, bandwidth_bps
+            )
+            solution.append(index_front)
+            solution.append(index_front+1)
+
+            print(f"\n方案 {i + 1}:")
+            print(f"总延迟: {delay:.8f}秒")
+            print(f"总通信量: {comm / 1e6:.2f}MB")
+            print(f"内存占用标准差: {mem_over:.2f}")
             print(f"负载均衡方差: {balance:.4f}")
 
             # 显示所有切割点
